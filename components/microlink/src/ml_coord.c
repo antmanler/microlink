@@ -706,6 +706,13 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     /* Auth - only include if auth_key is valid (matching v1 behavior) */
     if (ml->config.auth_key && strlen(ml->config.auth_key) > 0) {
         cJSON *auth = cJSON_CreateObject();
+        /* [ambient-mod] Diagnostic: confirm that the transmitted key is not
+         * truncated. **Log only its length.** The head is the fixed `tskey-`
+         * prefix and carries no information; the last four characters are a real
+         * secret leak. This line exists only to detect truncation, so one number
+         * is sufficient. Keep it: the next suspicion that firmware rewrote the key
+         * can be dismissed immediately without repeating the 2026-08-08 investigation. */
+        ESP_LOGW(TAG, "AuthKey being sent: len=%d", (int)strlen(ml->config.auth_key));
         cJSON_AddStringToObject(auth, "AuthKey", ml->config.auth_key);
         cJSON_AddItemToObject(root, "Auth", auth);
     }
@@ -935,6 +942,26 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     /* Null-terminate for cJSON */
     char saved = parse_start[parse_len];
     parse_start[parse_len] = '\0';
+
+    /* [ambient-mod] Diagnostic: print the complete RegisterResponse.
+     *
+     * Upstream dumps only the first 32 bytes, while the registration failure reason
+     * (AuthURL / Error / NeedsLogin / MachineAuthorized) appears later. This consumed
+     * an entire investigation: every preceding log looked normal, then MapRequest
+     * suddenly returned "node not found" because do_register **does not check for
+     * failure** and reports success even when the response has no "Node".
+     * Print in chunks because ESP_LOG has a per-entry length limit and silently
+     * truncates long responses. */
+    {
+        const int kChunk = 160;   /* Display-only limit, not a protocol parameter */
+        ESP_LOGW(TAG, "=== RegisterResponse full JSON (%d bytes) ===", (int)parse_len);
+        for (int off = 0; off < (int)parse_len; off += kChunk) {
+            int n = (int)parse_len - off;
+            if (n > kChunk) n = kChunk;
+            ESP_LOGW(TAG, "  [%3d] %.*s", off, n, parse_start + off);
+        }
+        ESP_LOGW(TAG, "=== end RegisterResponse ===");
+    }
 
     cJSON *resp_json = cJSON_Parse(parse_start);
     if (!resp_json) {

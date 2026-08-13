@@ -59,10 +59,18 @@ extern "C" {
 #define ML_TASK_WG_MGR_PRIO     7
 #define ML_TASK_WG_MGR_CORE     1
 
-/* Queue depths */
+/* Queue depths.
+ *
+ * WG/DISCO RX were 8 each. With the transport socket's lwip recvmbox (6) that
+ * bounded the whole RX pipeline at ~14 datagrams — a single TCP burst inside
+ * the tunnel overflows it, dropping data AND disco pings together, so the far
+ * end demotes the direct path to DERP (measured 2026-08-12: 10-17 s outages
+ * during TTS downlink, disco pong loss 10/30 under load, clean at idle).
+ * 32 covers a full sender burst (TCP_WND 11680/1220 ≈ 10 segs) three times
+ * over; cost is 32×sizeof(ml_rx_packet_t) queue slots, payloads stay heap. */
 #define ML_DERP_TX_QUEUE_DEPTH  16
-#define ML_DISCO_RX_QUEUE_DEPTH 8
-#define ML_WG_RX_QUEUE_DEPTH    8
+#define ML_DISCO_RX_QUEUE_DEPTH 16
+#define ML_WG_RX_QUEUE_DEPTH    32
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400

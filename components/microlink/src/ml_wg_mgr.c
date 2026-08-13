@@ -181,6 +181,32 @@ static err_t wg_derp_output_cb(const uint8_t *peer_public_key,
  * on that thread. */
 static struct udp_pcb *s_wg_output_pcb = NULL;
 
+/* [ambient-mod] Payload sent off-thread. The first half of the comment above is
+ * correct: calling BSD sendto() from tcpip_thread does deadlock, so it cannot be
+ * used there. But the conclusion that "raw udp_sendto is safe from any thread"
+ * is wrong: the raw API may only be called from tcpip_thread. The correct way out
+ * is to **dispatch by the caller's thread**, as explained in wg_udp_output_cb. */
+typedef struct {
+    struct udp_pcb *pcb;
+    ip_addr_t dst;
+    uint16_t port;
+    uint16_t len;
+    uint8_t data[];
+} wg_tx_defer_t;
+
+/* Perform the actual send on tcpip_thread. This follows the shape of
+ * zc_send_in_tcpip in ml_zerocopy.c. */
+static void wg_send_in_tcpip(void *arg) {
+    wg_tx_defer_t *d = (wg_tx_defer_t *)arg;
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, d->len, PBUF_RAM);
+    if (p) {
+        memcpy(p->payload, d->data, d->len);
+        udp_sendto(d->pcb, p, &d->dst, d->port);
+        pbuf_free(p);
+    }
+    free(d);
+}
+
 static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
                                 const uint8_t *data, size_t len, void *ctx) {
     microlink_t *ml = (microlink_t *)ctx;
@@ -188,27 +214,70 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
 
     /* Log WG packets sent via direct UDP */
     uint32_t ip_host = ntohl(dest_ip);
-    ESP_LOGI(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
+    /* [ambient-mod][diagnostic] Print the **caller's task**. This line exposed the
+     * root cause: the field logs contained both `[task=ml_wg_mgr]` for handshakes
+     * and keepalives and tcpip_thread in the data-packet backtrace, proving that
+     * two tasks were calling the same raw lwIP API. **Keep this as a regression
+     * signal after the fix**: the direct-send path should show only tcpip_thread. */
+    ESP_LOGI(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d [task=%s]",
              (int)len,
              (int)((ip_host >> 24) & 0xFF), (int)((ip_host >> 16) & 0xFF),
              (int)((ip_host >> 8) & 0xFF), (int)(ip_host & 0xFF),
              (int)dest_port,
-             len >= 1 ? data[0] : -1);
+             len >= 1 ? data[0] : -1,
+             pcTaskGetName(NULL));
 
-    /* Use raw PCB to send — safe from any thread context */
     if (!s_wg_output_pcb) return ERR_CONN;
-
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
-    if (!p) return ERR_MEM;
-    memcpy(p->payload, data, len);
 
     ip_addr_t dst;
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
     ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
 
-    err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
-    pbuf_free(p);
-    return err;
+    /* [ambient-mod] This callback has **two callers running on different tasks**.
+     *
+     * The original comment said "Use raw PCB to send — safe from any thread
+     * context". That statement was wrong and caused this crash:
+     *   - Data packets: ip4_output → wireguardif_output → here on **tcpip_thread**
+     *   - Handshakes/keepalives: here on **ml_wg_mgr** (field log `[task=ml_wg_mgr]`)
+     * CONFIG_LWIP_TCPIP_CORE_LOCKING is disabled, so raw APIs such as udp_sendto
+     * must be used by one thread only. Concurrent access to the same PCB from two
+     * tasks corrupts the heap; a later malloc then hits
+     * `assert failed: block_locate_free`, exactly where the field backtrace ended.
+     *
+     * This is the same bug class fixed by upstream PR #20, where the wg_mgr task
+     * called ip_input directly, but in the opposite direction: that case received;
+     * this one sends.
+     *
+     * The fix is not novel: **microlink already implements the correct pattern in
+     * ml_zerocopy.c** with `tcpip_callback(zc_send_in_tcpip, ctx)`, documented as
+     * "for thread safety". Follow that shape here. The only difference is that
+     * zerocopy is a high-frequency path and therefore uses a ring pool, while the
+     * off-thread packets reaching this path are only handshakes and keepalives
+     * (seconds apart, ≤148 B). One malloc is sufficient; a pool is not justified. */
+    if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
+        struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
+        if (!p) return ERR_MEM;
+        memcpy(p->payload, data, len);
+        err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+        pbuf_free(p);
+        return err;
+    }
+
+    wg_tx_defer_t *d = (wg_tx_defer_t *)malloc(sizeof(*d) + len);
+    if (!d) return ERR_MEM;
+    d->pcb = s_wg_output_pcb;
+    d->dst = dst;
+    d->port = dest_port;
+    d->len = (uint16_t)len;
+    memcpy(d->data, data, len);
+    /* Use try_callback rather than callback: if the queue is full, drop this one
+     * packet and return ERR_MEM without blocking the caller. WireGuard retries a
+     * dropped handshake or keepalive; blocking ml_wg_mgr stalls the entire tunnel. */
+    if (tcpip_try_callback(wg_send_in_tcpip, d) != ERR_OK) {
+        free(d);
+        return ERR_MEM;
+    }
+    return ERR_OK;
 }
 
 /* ============================================================================
@@ -244,6 +313,18 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
         free(netif);
         return ESP_FAIL;
     }
+
+    /* [ambient-mod 2026-08-12] Tailscale-standard MTU, replacing wireguardif's 1420.
+     *
+     * 1420 advertises TCP MSS 1380 -> peer sends 1420B inner packets -> +60B WG
+     * encap +28B IP/UDP = 1508B on the wire, over the WiFi MTU of 1500 -> the
+     * sender fragments, and esp-idf lwIP has IP reassembly DISABLED by default,
+     * so every fragmented packet is silently dropped. Field proof (office, direct
+     * WG path): ping -s 1400 = 100% loss, -s 1100 = 0%, LAN -s 1400 = 0%; TTS
+     * downlink (1.3-1.5KB TCP segments) crawled at 0.4x realtime while small
+     * uplink packets flowed fine. 1280 is what Tailscale itself uses (macOS utun
+     * MTU = 1280), leaving 1280+60+28 = 1368 on the wire - safe margin. */
+    netif->mtu = 1280;
 
     /* Set IP addresses: our VPN IP (or temporary until we get one) */
     if (ml->vpn_ip != 0) {
@@ -958,6 +1039,29 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                                  (int)pkt->src_port, p->hostname);
                     }
                 } else {
+                    /* [ambient-mod] Diagnostic: ask the device's own table instead
+                     * of guessing. It answered in one read what took two rounds of
+                     * speculation: which slot holds the session and whether the same
+                     * remote peer occupies two slots. Keep it. */
+                    {
+                        struct wireguard_device *dbg = (struct wireguard_device *)netif->state;
+                        ESP_LOGW(TAG, "  [peers] %s wants wg_idx=%d; device table:",
+                                 p->hostname, (int)p->wg_peer_index);
+                        if (dbg) {
+                            for (int k = 0; k < WIREGUARD_MAX_PEERS; k++) {
+                                struct wireguard_peer *pp = &dbg->peers[k];
+                                if (!pp->valid) continue;
+                                ESP_LOGW(TAG, "    slot=%d active=%d curr_valid=%d prev_valid=%d "
+                                              "ep=%s:%u pub=%02x%02x%02x%02x",
+                                         k, (int)pp->active, (int)pp->curr_keypair.valid,
+                                         (int)pp->prev_keypair.valid,
+                                         ip_addr_isany(&pp->ip) ? "DERP" : ipaddr_ntoa(&pp->ip),
+                                         (unsigned)pp->port,
+                                         pp->public_key[0], pp->public_key[1],
+                                         pp->public_key[2], pp->public_key[3]);
+                            }
+                        }
+                    }
                     ESP_LOGI(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
                              (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                              (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
@@ -978,15 +1082,12 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                          * wireguardif_connect sets active=true internally, so
                          * we immediately clear it after to prevent retries. */
                         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                        /* Clear active to prevent infinite retry loop.
-                         * If handshake succeeds, the response handler will
-                         * establish the session regardless of active flag. */
-                        {
-                            struct wireguard_device *dev = (struct wireguard_device *)netif->state;
-                            if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
-                                dev->peers[p->wg_peer_index].active = false;
-                            }
-                        }
+                        /* [ambient-mod] **Removed the three upstream lines that
+                         * cleared active here.** active is not a "retry switch"; it
+                         * is the master gate at wireguardif.c:1078 for whether this
+                         * peer may initiate a session. Clearing it means no session
+                         * can ever be established. Field evidence: all 12 device
+                         * peer slots had active=0/curr_valid=0. See the patch header. */
                         ESP_LOGI(TAG, "WG one-shot handshake to %s (first direct path)", p->hostname);
                     }
                 }

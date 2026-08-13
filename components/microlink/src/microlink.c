@@ -8,6 +8,7 @@
 
 #include "microlink_internal.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"  /* [ambient-mod] PSRAM task stacks */
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
@@ -37,6 +38,57 @@ static const char *TAG = "microlink";
 
 /* X25519 from x25519.h */
 #include "x25519.h"
+/* ============================================================================
+ * [ambient-mod] Move selected task stacks to PSRAM
+ * ============================================================================
+ *
+ * Problem: these four task stacks total 42KB (net_io 8 + derp_tx 14 + coord 12
+ * + wg_mgr 8), while the rig-hover host project has only about 59KB of free
+ * internal heap. microlink_start reports "Failed to create coord task", retries
+ * every 5 seconds, and never joins the tailnet.
+ *
+ * Why **selected** rather than all tasks: the second attempt moved every stack
+ * and put the device into a reboot loop:
+ *     assert failed: spi_flash_disable_interrupts_caches_and_other_cpu
+ *                    cache_utils.c:127 (esp_task_stack_is_sane_cache_disabled())
+ * ESP-IDF has a hard constraint: a task whose stack resides in PSRAM cannot run
+ * any operation that disables the flash cache (NVS / SPI flash), because PSRAM
+ * access itself requires the cache.
+ *
+ * Call-graph analysis, including indirect calls rather than only grepping task bodies:
+ *   ml_net_io_task   does not touch flash  → PSRAM stack
+ *   ml_derp_tx_task  does not touch flash  → PSRAM stack
+ *   ml_coord_task    does not touch flash  → PSRAM stack
+ *   ml_wg_mgr_task   does: process_peer_updates → ml_peer_nvs_* (ml_peer_nvs.c)
+ *                                                → stack stays in internal RAM
+ *
+ * Net effect: internal RAM demand falls from 42KB to 8KB.
+ *
+ * Unit trap: xTaskCreate* stack parameters are in **bytes**; xTaskCreateStatic*
+ * parameters are in **words**. Omitting /sizeof(StackType_t) makes the stack four
+ * times too small, causing random stack overflows that are harder to diagnose than
+ * OOM. TCBs always remain in internal RAM because FreeRTOS accesses them in
+ * critical sections.
+ */
+#define ML_CREATE_TASK_PSRAM(fn, tname, stackbytes, prio, field, core)                  \
+    do {                                                                                \
+        static StaticTask_t tcb_##field;                                                \
+        StackType_t *stk_##field =                                                      \
+            (StackType_t *)heap_caps_malloc((stackbytes), MALLOC_CAP_SPIRAM);           \
+        if (stk_##field == NULL) {                                                      \
+            ESP_LOGE(TAG, "Failed to alloc %s stack (%d B) in PSRAM", tname,            \
+                     (int)(stackbytes));                                                \
+            return ESP_FAIL;                                                            \
+        }                                                                               \
+        ml->field = xTaskCreateStaticPinnedToCore(                                      \
+            fn, tname, (stackbytes) / sizeof(StackType_t), ml, prio,                    \
+            stk_##field, &tcb_##field, core);                                           \
+        if (ml->field == NULL) {                                                        \
+            ESP_LOGE(TAG, "Failed to create %s task", tname);                           \
+            return ESP_FAIL;                                                            \
+        }                                                                               \
+    } while (0)
+
 
 /* ============================================================================
  * Key Management (loaded once at init, read-only after)
@@ -367,30 +419,19 @@ skip_bsd_socket:
     ;
 #endif
 
-    /* Create tasks */
+    /* Create tasks — [ambient-mod] The first three stacks live in PSRAM; wg_mgr
+     * touches NVS and must remain internal. */
     BaseType_t ret;
 
-    ret = xTaskCreatePinnedToCore(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
-                                   ml, ML_TASK_NET_IO_PRIO, &ml->net_io_task, ML_TASK_NET_IO_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create net_io task");
-        return ESP_FAIL;
-    }
+    ML_CREATE_TASK_PSRAM(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
+                         ML_TASK_NET_IO_PRIO, net_io_task, ML_TASK_NET_IO_CORE);
+    ML_CREATE_TASK_PSRAM(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
+                         ML_TASK_DERP_TX_PRIO, derp_tx_task, ML_TASK_DERP_TX_CORE);
+    ML_CREATE_TASK_PSRAM(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
+                         ML_TASK_COORD_PRIO, coord_task, ML_TASK_COORD_CORE);
 
-    ret = xTaskCreatePinnedToCore(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
-                                   ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create derp_tx task");
-        return ESP_FAIL;
-    }
-
-    ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
-                                   ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create coord task");
-        return ESP_FAIL;
-    }
-
+    /* wg_mgr calls process_peer_updates → ml_peer_nvs_*, which disables the
+     * flash cache, so its stack must remain in internal RAM. */
     ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
                                    ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
     if (ret != pdPASS) {
