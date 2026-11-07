@@ -35,6 +35,7 @@ static const char *TAG = "microlink";
 #define NVS_KEY_WG_PUB      "wg_public"
 #define NVS_KEY_DISCO_PRI   "disco_pri"
 #define NVS_KEY_DISCO_PUB   "disco_pub"
+#define NVS_KEY_WG_OLD_PUB  "wg_old_pub"   /* expired node public key while a rotation is pending */
 
 /* X25519 from x25519.h */
 #include "x25519.h"
@@ -102,10 +103,23 @@ static void generate_keypair(uint8_t *private_key, uint8_t *public_key) {
     x25519_base(public_key, private_key, 1);
 }
 
+/* Write one 32-byte key; keeps the first error seen. */
+static esp_err_t set_blob32(nvs_handle_t nvs, const char *key, const uint8_t *value,
+                            esp_err_t first_error) {
+    esp_err_t e = nvs_set_blob(nvs, key, value, 32);
+    return first_error != ESP_OK ? first_error : e;
+}
+
 static esp_err_t load_or_generate_keys(microlink_t *ml) {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
+        if (ml->interactive) {
+            /* Interactive login needs a node identity that survives reboot:
+             * ephemeral keys would register a new node on every boot. */
+            ESP_LOGE(TAG, "NVS open failed (%d): identity cannot persist", err);
+            return err;
+        }
         ESP_LOGW(TAG, "NVS open failed (%d), generating ephemeral keys", err);
         generate_keypair(ml->machine_private_key, ml->machine_public_key);
         generate_keypair(ml->wg_private_key, ml->wg_public_key);
@@ -133,8 +147,16 @@ static esp_err_t load_or_generate_keys(microlink_t *ml) {
         need_save = true;
         ESP_LOGI(TAG, "Generated new WireGuard key");
     } else {
+        /* The private half is authoritative. A node key rotation interrupted
+         * between its two NVS writes would otherwise leave a mismatched pair. */
+        uint8_t derived_pub[32];
+        x25519_base(derived_pub, ml->wg_private_key, 1);
         key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, &key_len);
+        if (nvs_get_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, &key_len) != ESP_OK ||
+            memcmp(derived_pub, ml->wg_public_key, 32) != 0) {
+            memcpy(ml->wg_public_key, derived_pub, 32);
+            need_save = true;
+        }
     }
 
     /* DISCO key */
@@ -149,16 +171,36 @@ static esp_err_t load_or_generate_keys(microlink_t *ml) {
     }
 
     if (need_save) {
-        nvs_set_blob(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_DISCO_PUB, ml->disco_public_key, 32);
-        nvs_commit(nvs);
-        ESP_LOGI(TAG, "Keys saved to NVS");
+        esp_err_t save_err = ESP_OK;
+        save_err = set_blob32(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, save_err);
+        save_err = set_blob32(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, save_err);
+        save_err = set_blob32(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, save_err);
+        save_err = set_blob32(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, save_err);
+        save_err = set_blob32(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, save_err);
+        save_err = set_blob32(nvs, NVS_KEY_DISCO_PUB, ml->disco_public_key, save_err);
+        esp_err_t commit_err = nvs_commit(nvs);
+        if (save_err == ESP_OK) save_err = commit_err;
+        if (save_err != ESP_OK) {
+            ESP_LOGE(TAG, "Saving keys to NVS failed (%d)", save_err);
+            if (ml->interactive) {
+                nvs_close(nvs);
+                return save_err;
+            }
+        } else {
+            ESP_LOGI(TAG, "Keys saved to NVS");
+        }
     } else {
         ESP_LOGI(TAG, "Keys loaded from NVS");
+    }
+
+    /* Rotation pending? The expired key is sent as OldNodeKey until a register
+     * succeeds. Equal to the current key means a torn rotation write: ignore. */
+    key_len = 32;
+    ml->old_node_valid = (nvs_get_blob(nvs, NVS_KEY_WG_OLD_PUB, ml->old_node_pub, &key_len) == ESP_OK &&
+                          key_len == 32 &&
+                          memcmp(ml->old_node_pub, ml->wg_public_key, 32) != 0);
+    if (ml->old_node_valid) {
+        ESP_LOGW(TAG, "Node key rotation pending (re-register with OldNodeKey)");
     }
 
     nvs_close(nvs);
@@ -204,8 +246,8 @@ esp_err_t microlink_factory_reset(void) {
  * ========================================================================== */
 
 microlink_t *microlink_init(const microlink_config_t *config) {
-    if (!config || !config->auth_key) {
-        ESP_LOGE(TAG, "Invalid config: auth_key required");
+    if (!config) {
+        ESP_LOGE(TAG, "Invalid config");
         return NULL;
     }
 
@@ -223,8 +265,11 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         return NULL;
     }
 
-    /* Copy config */
+    /* Copy config. The auth key is optional: without it the node logs in
+     * interactively and its identity must persist. */
     ml->config = *config;
+    ml->interactive = !(config->auth_key && config->auth_key[0]);
+    portMUX_INITIALIZE(&ml->id_lock);
     if (ml->config.max_peers == 0) ml->config.max_peers = ML_MAX_PEERS;
     if (ml->config.max_peers > ML_MAX_PEERS) ml->config.max_peers = ML_MAX_PEERS;
     ml->config.enable_derp = true;  /* Always need DERP for relay */
@@ -250,17 +295,17 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         }
     }
 
-    /* Load or generate persistent keys */
-    if (load_or_generate_keys(ml) != ESP_OK) {
-        free(ml);
-        return NULL;
+    /* Load or generate persistent keys. Fails only in interactive mode when NVS
+     * cannot hold them; the handle then reports ML_ERR_STORAGE (see the end). */
+    bool storage_failed = (load_or_generate_keys(ml) != ESP_OK);
+
+    if (!storage_failed) {
+        /* Initialize peer NVS cache */
+        ml_peer_nvs_init();
+
+        /* Initialize HTTP config server (loads NVS peer allowlist + settings) */
+        ml->config_httpd = ml_config_httpd_init();
     }
-
-    /* Initialize peer NVS cache */
-    ml_peer_nvs_init();
-
-    /* Initialize HTTP config server (loads NVS peer allowlist + settings) */
-    ml->config_httpd = ml_config_httpd_init();
 
     /* Override config with NVS-saved settings (web UI save → restart flow).
      * NVS settings take priority over Kconfig defaults.  Strings are copied
@@ -278,7 +323,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
             /* Full custom hostname (e.g. "sensor-tailscale") */
             strncpy(ml->nvs_device_name, nvs_full_name, sizeof(ml->nvs_device_name) - 1);
             ml->config.device_name = ml->nvs_device_name;
-            ESP_LOGI(TAG, "Device name from NVS (full): %s", ml->nvs_device_name);
+            ESP_LOGI(TAG, "Device name overridden from NVS (full)");
         } else {
             const char *nvs_prefix = ml_config_get_device_prefix(ml->config_httpd);
             if (nvs_prefix) {
@@ -288,7 +333,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
                 snprintf(ml->nvs_device_name, sizeof(ml->nvs_device_name),
                          "%s-%02x%02x%02x", nvs_prefix, mac[3], mac[4], mac[5]);
                 ml->config.device_name = ml->nvs_device_name;
-                ESP_LOGI(TAG, "Device name from NVS (prefix): %s", ml->nvs_device_name);
+                ESP_LOGI(TAG, "Device name overridden from NVS (prefix + MAC)");
             }
         }
 
@@ -322,6 +367,8 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         }
     }
 
+    ml->interactive = !(ml->config.auth_key && ml->config.auth_key[0]);
+
     /* Create event group */
     ml->events = xEventGroupCreate();
     if (!ml->events) {
@@ -343,6 +390,13 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         ESP_LOGE(TAG, "Failed to create queues");
         microlink_destroy(ml);
         return NULL;
+    }
+
+    if (storage_failed) {
+        ml->state = ML_STATE_ERROR;
+        ml->last_error = ML_ERR_STORAGE;
+        ESP_LOGE(TAG, "MicroLink initialized in ERROR state (storage); start is refused");
+        return ml;
     }
 
     ESP_LOGI(TAG, "MicroLink v2 initialized (max_peers=%d)", ml->config.max_peers);
@@ -579,6 +633,7 @@ esp_err_t microlink_stop(microlink_t *ml) {
     if (ml->stun_sock >= 0) { ml_close_sock(ml->stun_sock); ml->stun_sock = -1; }
     if (ml->stun_sock6 >= 0) { ml_close_sock(ml->stun_sock6); ml->stun_sock6 = -1; }
 
+    ml_set_auth_url(ml, NULL);   /* a pending login does not survive stop */
     ml->state = ML_STATE_IDLE;
     ESP_LOGI(TAG, "Stopped");
     return ESP_OK;
@@ -609,13 +664,113 @@ void microlink_destroy(microlink_t *ml) {
     /* Delete event group */
     if (ml->events) vEventGroupDelete(ml->events);
 
-    /* Clear keys from memory */
+    /* Clear keys and the login URL from memory */
+    ml_set_auth_url(ml, NULL);
     memset(ml->machine_private_key, 0, 32);
     memset(ml->wg_private_key, 0, 32);
     memset(ml->disco_private_key, 0, 32);
 
     free(ml);
     ESP_LOGI(TAG, "Destroyed");
+}
+
+/* ============================================================================
+ * Identity: node key rotation (DESIGN section 7 item 8 / section 12)
+ *
+ * NVS access disables the flash cache, which a task with a PSRAM stack must
+ * never trigger (see ML_CREATE_TASK_PSRAM). The coord task is such a task, so
+ * its two NVS operations run on a short-lived helper task with an internal
+ * stack. The stack size is that of the wg_mgr task, the existing NVS user.
+ * ========================================================================== */
+
+typedef enum { NVS_JOB_ROTATE, NVS_JOB_CLEAR_OLD } nvs_job_op_t;
+
+typedef struct {
+    nvs_job_op_t op;
+    uint8_t old_pub[32];
+    uint8_t new_priv[32];
+    uint8_t new_pub[32];
+    TaskHandle_t waiter;
+    esp_err_t result;
+} nvs_job_t;
+
+static esp_err_t nvs_job_run_now(const nvs_job_t *job) {
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    if (job->op == NVS_JOB_ROTATE) {
+        /* Order matters: the old public key first, so an interruption never
+         * leaves a new private key without the key it replaces. A private key
+         * written without its public half is repaired at load. */
+        err = nvs_set_blob(nvs, NVS_KEY_WG_OLD_PUB, job->old_pub, 32);
+        if (err == ESP_OK) err = nvs_set_blob(nvs, NVS_KEY_WG_PRI, job->new_priv, 32);
+        if (err == ESP_OK) err = nvs_set_blob(nvs, NVS_KEY_WG_PUB, job->new_pub, 32);
+    } else {
+        err = nvs_erase_key(nvs, NVS_KEY_WG_OLD_PUB);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+    }
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+static void nvs_job_task(void *arg) {
+    nvs_job_t *job = (nvs_job_t *)arg;
+    TaskHandle_t waiter = job->waiter;
+    job->result = nvs_job_run_now(job);
+    xTaskNotifyGive(waiter);   /* job may be gone after this */
+    vTaskDelete(NULL);
+}
+
+static esp_err_t nvs_job_run(nvs_job_t *job) {
+    job->waiter = xTaskGetCurrentTaskHandle();
+    job->result = ESP_FAIL;
+    if (xTaskCreate(nvs_job_task, "ml_nvs", ML_TASK_WG_MGR_STACK, job,
+                    ML_TASK_COORD_PRIO, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return job->result;
+}
+
+esp_err_t ml_identity_rotate_node_key(microlink_t *ml, uint8_t new_priv[32], uint8_t new_pub[32]) {
+    if (!ml || !new_priv || !new_pub) return ESP_ERR_INVALID_ARG;
+    if (ml->old_node_valid) return ESP_ERR_INVALID_STATE;   /* one rotation at a time */
+
+    nvs_job_t job = { .op = NVS_JOB_ROTATE };
+    memcpy(job.old_pub, ml->wg_public_key, 32);
+    generate_keypair(job.new_priv, job.new_pub);
+
+    esp_err_t err = nvs_job_run(&job);
+    if (err == ESP_OK) {
+        memcpy(new_priv, job.new_priv, 32);
+        memcpy(new_pub, job.new_pub, 32);
+        memcpy(ml->old_node_pub, job.old_pub, 32);
+        ml->old_node_valid = true;
+    }
+    memset(job.new_priv, 0, sizeof(job.new_priv));
+    return err;
+}
+
+void ml_identity_clear_old_node_key(microlink_t *ml) {
+    if (!ml || !ml->old_node_valid) return;
+    nvs_job_t job = { .op = NVS_JOB_CLEAR_OLD };
+    if (nvs_job_run(&job) == ESP_OK) {
+        ml->old_node_valid = false;
+        memset(ml->old_node_pub, 0, sizeof(ml->old_node_pub));
+    }
+    /* On failure the key stays: the next register sends OldNodeKey again, which is harmless. */
+}
+
+esp_err_t microlink_retry(microlink_t *ml) {
+    if (!ml) return ESP_ERR_INVALID_ARG;
+    if (ml->state != ML_STATE_ERROR) return ESP_ERR_INVALID_STATE;
+    if (ml->last_error == ML_ERR_KEY_ROTATED || ml->last_error == ML_ERR_STORAGE) {
+        return ESP_ERR_INVALID_STATE;   /* the keys in RAM are stale or missing: restart */
+    }
+    ml_coord_cmd_t cmd = ML_CMD_FORCE_RECONNECT;
+    return xQueueSend(ml->coord_cmd_queue, &cmd, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 /* ============================================================================

@@ -25,7 +25,8 @@ typedef struct microlink_s microlink_t;
 
 /* Configuration */
 typedef struct {
-    const char *auth_key;       /* Tailscale auth key (tskey-auth-...) */
+    const char *auth_key;       /* Tailscale auth key (tskey-auth-...). Optional: NULL or ""
+                                 * selects native interactive login (ML_STATE_NEEDS_LOGIN). */
     const char *device_name;    /* Device hostname on the tailnet */
     bool enable_derp;           /* Enable DERP relay (default: true) */
     bool enable_stun;           /* Enable STUN endpoint discovery */
@@ -64,10 +65,31 @@ typedef enum {
     ML_STATE_REGISTERING,
     ML_STATE_CONNECTED,
     ML_STATE_RECONNECTING,
-    ML_STATE_ERROR,
+    ML_STATE_ERROR,                 /* terminal until microlink_retry(); see microlink_get_error() */
+    /* Appended after ML_STATE_ERROR so existing numeric values do not move. */
+    ML_STATE_NEEDS_LOGIN,           /* interactive login pending: microlink_copy_auth_url() */
+    ML_STATE_NEEDS_MACHINE_AUTH,    /* logged in, waiting for an admin to approve this machine
+                                     * (SelfNode.MachineAuthorized; interactive mode only) */
 } microlink_state_t;
 
-/* Callback types */
+/* Error category, valid while microlink_get_state() == ML_STATE_ERROR and, for the
+ * retried categories, also while the stack is reconnecting. No server text is kept. */
+typedef enum {
+    ML_ERR_NONE = 0,
+    ML_ERR_NETWORK,             /* control plane unreachable or timed out (retried automatically) */
+    ML_ERR_PROTOCOL,            /* empty or malformed control response (retried automatically) */
+    ML_ERR_REGISTER_REJECTED,   /* RegisterResponse.Error: bad, used or expired auth key; login
+                                 * denied or expired. Terminal: call microlink_retry(). */
+    ML_ERR_TAILNET_LOCK,        /* tailnet lock is enabled: unsupported. Terminal. */
+    ML_ERR_KEY_ROTATED,         /* node key expired; a new key is stored. Terminal: reboot or
+                                 * destroy + init, then log in again. */
+    ML_ERR_NODE_KEY_EXPIRED,    /* a freshly rotated key was reported expired again. Terminal. */
+    ML_ERR_STORAGE,             /* NVS cannot hold the identity keys. Terminal. */
+} microlink_error_t;
+
+/* Callback types.
+ * The state callback runs on the coord task, whose stack lives in PSRAM: do not call
+ * NVS or flash APIs from it. Hand the work to another task instead. */
 typedef void (*microlink_state_cb_t)(microlink_t *ml, microlink_state_t state, void *user_data);
 typedef void (*microlink_peer_cb_t)(microlink_t *ml, const microlink_peer_info_t *peer, void *user_data);
 typedef void (*microlink_data_cb_t)(microlink_t *ml, uint32_t src_ip, const uint8_t *data,
@@ -91,6 +113,13 @@ esp_err_t microlink_factory_reset(void);
  *
  * Creates all internal tasks, queues, and event groups.
  * Does NOT start connecting - call microlink_start() for that.
+ *
+ * config->auth_key is optional. Without it (NULL or "") the node identity
+ * must persist: if the NVS namespace "microlink" cannot be opened or written,
+ * the returned handle is in ML_STATE_ERROR with ML_ERR_STORAGE and
+ * microlink_start() refuses, instead of silently using ephemeral keys (which
+ * would create a new node on every boot). With an auth key the legacy
+ * behaviour is unchanged.
  */
 microlink_t *microlink_init(const microlink_config_t *config);
 
@@ -146,6 +175,63 @@ microlink_state_t microlink_get_state(const microlink_t *ml);
  * @brief Check if connected and ready to send/receive
  */
 bool microlink_is_connected(const microlink_t *ml);
+
+/**
+ * @brief Get the category of the last error
+ * @return ML_ERR_NONE when there is none. Cleared when the stack connects.
+ */
+microlink_error_t microlink_get_error(const microlink_t *ml);
+
+/**
+ * @brief Leave ML_STATE_ERROR and register again
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE unless the state is ML_STATE_ERROR and the
+ *         category is not ML_ERR_KEY_ROTATED / ML_ERR_STORAGE (those need a restart)
+ *
+ * Starts a fresh registration, which yields a new AuthURL when login is needed.
+ */
+esp_err_t microlink_retry(microlink_t *ml);
+
+/**
+ * @brief Copy the pending login URL into caller memory
+ * @param buf Output buffer
+ * @param len Size of buf in bytes, including room for the terminating NUL
+ * @return ESP_OK on success
+ *         ESP_ERR_NOT_FOUND if no login is pending (state is not ML_STATE_NEEDS_LOGIN)
+ *         ESP_ERR_INVALID_SIZE if buf is too small; buf is left untouched, never truncated
+ *         ESP_ERR_INVALID_ARG on NULL arguments
+ *
+ * The URL is a login capability: whoever opens it can attach this device to
+ * their own tailnet. It is kept in RAM only, never logged, and wiped when the
+ * login finishes or the handle is destroyed.
+ */
+esp_err_t microlink_copy_auth_url(const microlink_t *ml, char *buf, size_t len);
+
+/** @brief Length of the pending login URL without the NUL; 0 when none. */
+size_t microlink_get_auth_url_length(const microlink_t *ml);
+
+/**
+ * @brief Copy the name this device announces to the control plane
+ *        (Hostinfo.Hostname). The Tailscale login page shows it, so it is
+ *        what the owner compares on screen before approving.
+ * @return ESP_OK, ESP_ERR_INVALID_SIZE (buf too small, untouched), ESP_ERR_INVALID_ARG
+ */
+esp_err_t microlink_copy_device_name(const microlink_t *ml, char *buf, size_t len);
+
+/**
+ * @brief Copy this node's own MagicDNS name from the netmap, without the trailing dot
+ *        (for example "p4-dock.tail1234.ts.net")
+ * @return ESP_OK, ESP_ERR_NOT_FOUND until the first netmap arrives,
+ *         ESP_ERR_INVALID_SIZE (buf too small, untouched), ESP_ERR_INVALID_ARG
+ */
+esp_err_t microlink_copy_self_fqdn(const microlink_t *ml, char *buf, size_t len);
+
+/**
+ * @brief Copy the tailnet's MagicDNS suffix (for example "tail1234.ts.net"),
+ *        neither starting nor ending with a dot. A host belongs to this tailnet
+ *        when its name equals the suffix or ends with "." + suffix.
+ * @return same codes as microlink_copy_self_fqdn()
+ */
+esp_err_t microlink_copy_magicdns_suffix(const microlink_t *ml, char *buf, size_t len);
 
 /**
  * @brief Get our assigned VPN IP

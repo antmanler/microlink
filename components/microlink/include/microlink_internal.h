@@ -116,10 +116,21 @@ extern "C" {
 #define ML_CTRL_WATCHDOG_MS             120000
 #define ML_CTRL_BACKOFF_MAX_MS          30000
 #define ML_CTRL_KEEPALIVE_MS            60000
+#define ML_H2_PING_INTERVAL_MS          5000    /* control-plane HTTP/2 PING, baseline value */
 
 /* Large tailnet buffer sizes (PSRAM-allocated, configurable via menuconfig) */
 #define ML_H2_BUFFER_SIZE       (CONFIG_ML_H2_BUFFER_SIZE_KB * 1024)
 #define ML_JSON_BUFFER_SIZE     (CONFIG_ML_JSON_BUFFER_SIZE_KB * 1024)
+
+/* Longest DNS name in presentation form without the trailing dot
+ * (RFC 1035 section 2.3.4: 255 octets on the wire). Bounds the self node name. */
+#define ML_DNS_NAME_MAX         253
+
+/* Register response read caps, kept from the baseline do_register() */
+#define ML_REG_MAX_NOISE_FRAMES 10
+#define ML_REG_H2_BUF_SIZE      16384
+#define ML_REG_BODY_BUF_SIZE    8192
+#define ML_REG_FRAME_BUF_SIZE   4096
 
 /* Noise protocol */
 #define ML_NOISE_KEY_LEN        32
@@ -428,6 +439,18 @@ struct microlink_s {
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
     bool key_expired;               /* true if Node.Expired == true */
 
+    /* Interactive login and identity (coord task writes; the app reads through the
+     * microlink_copy_* getters, which take id_lock). */
+    bool interactive;               /* no auth key configured: identity must persist */
+    volatile microlink_error_t last_error;
+    portMUX_TYPE id_lock;           /* guards auth_url and self_fqdn */
+    char *auth_url;                 /* heap, NULL when no login is pending; never logged */
+    char self_fqdn[ML_DNS_NAME_MAX + 1];  /* own MagicDNS name from the netmap, no trailing dot */
+    bool machine_auth_known;        /* a netmap self node has been seen */
+    volatile bool machine_authorized;     /* SelfNode.MachineAuthorized (DESIGN section 7.3) */
+    bool old_node_valid;            /* node key rotation pending: register carries OldNodeKey */
+    uint8_t old_node_pub[32];       /* the expired node public key, persisted until re-registered */
+
     /* Resolved timing (set during init from config, 0 = default) */
     uint32_t t_disco_heartbeat_ms;
     uint32_t t_stun_interval_ms;
@@ -538,6 +561,13 @@ void ml_zerocopy_deinit(microlink_t *ml);
 esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
                             uint32_t dest_ip, uint16_t dest_port);
 #endif
+
+/* microlink.c: identity, login URL and self name (shared data takes id_lock) */
+esp_err_t ml_identity_rotate_node_key(microlink_t *ml, uint8_t new_priv[32], uint8_t new_pub[32]);
+void ml_identity_clear_old_node_key(microlink_t *ml);
+void ml_set_auth_url(microlink_t *ml, const char *url_or_null);
+void ml_set_self_fqdn(microlink_t *ml, const char *fqdn);
+const char *ml_device_name(const microlink_t *ml);   /* Hostinfo.Hostname */
 
 /* Utility */
 uint64_t ml_get_time_ms(void);
