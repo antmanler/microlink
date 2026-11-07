@@ -1,0 +1,53 @@
+# Host harness for the interactive-login path (DESIGN section 10, probe P3).
+#
+#   make test    unit tests of the register codec and the login getters
+#   make probe   build the P3 probe
+#   make run     run the probe against the real control server (keyless register;
+#                prints states only, never the login URL)
+#
+# The firmware sources compile unchanged. Only the FreeRTOS / lwIP / ESP headers
+# are shims (shim/); mbedtls and cJSON come from ESP-IDF's own source tree.
+
+IDF_PATH ?= $(HOME)/esp/esp-idf-v5.5.3
+HERE     := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+ML       := $(HERE)/../../components/microlink
+WG       := $(ML)/components/wireguard_lwip/src
+MBEDTLS  := $(IDF_PATH)/components/mbedtls/mbedtls
+CJSON    := $(IDF_PATH)/components/json/cJSON
+OUT      := $(HERE)/build
+
+CC       ?= cc
+CFLAGS   ?= -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
+INCLUDES := -I$(HERE)/shim -I$(ML)/include -I$(ML)/src -I$(WG) -I$(WG)/crypto/refc \
+            -I$(CJSON) -I$(MBEDTLS)/include -I$(MBEDTLS)/library
+LDLIBS   := -lm
+
+MBED_SRC := chacha20 chachapoly poly1305 platform_util platform constant_time base64
+LIB_SRC  := $(ML)/src/ml_register.c $(ML)/src/ml_login.c $(ML)/src/ml_h2.c $(ML)/src/ml_noise.c \
+            $(ML)/src/x25519.c $(WG)/crypto/refc/blake2s.c $(CJSON)/cJSON.c \
+            $(addprefix $(MBEDTLS)/library/,$(addsuffix .c,$(MBED_SRC))) $(HERE)/host_stubs.c
+
+.PHONY: all test probe run clean
+all: test probe
+
+$(OUT):
+	mkdir -p $(OUT)
+
+# Each .c is compiled separately; ml_coord.c is #included by probe.c, so probe.c
+# needs no other copy of it.
+$(OUT)/test_codec: $(HERE)/test_codec.c $(LIB_SRC) | $(OUT)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $(HERE)/test_codec.c $(LIB_SRC) $(LDLIBS)
+
+$(OUT)/probe: $(HERE)/probe.c $(ML)/src/ml_coord.c $(LIB_SRC) | $(OUT)
+	$(CC) $(CFLAGS) $(INCLUDES) -I$(ML)/src -o $@ $(HERE)/probe.c $(LIB_SRC) $(LDLIBS)
+
+test: $(OUT)/test_codec
+	$(OUT)/test_codec
+
+probe: $(OUT)/probe
+
+run: $(OUT)/probe
+	$(OUT)/probe $(ARGS)
+
+clean:
+	rm -rf $(OUT)
