@@ -37,13 +37,40 @@ void microlink_ip_to_str(uint32_t ip, char *buf) {
              (unsigned)((ip >> 16) & 0xFF), (unsigned)(ip >> 24));
 }
 
-/* Node key rotation writes NVS on the device; the probe never reaches it
- * (it never sees NodeKeyExpired because every key is brand new). */
+/* Node key rotation writes NVS on the device. The stub mimics its RAM effects and lets a
+ * test choose the outcome and count the calls. */
+int stub_rotate_calls;
+int stub_clear_calls;
+esp_err_t stub_rotate_result = ESP_OK;
+
 esp_err_t ml_identity_rotate_node_key(microlink_t *ml, uint8_t new_priv[32], uint8_t new_pub[32]) {
-    (void)ml; (void)new_priv; (void)new_pub;
-    return ESP_FAIL;
+    stub_rotate_calls++;
+    if (stub_rotate_result != ESP_OK) return stub_rotate_result;
+    memset(new_priv, 0x11, 32);
+    memset(new_pub, 0x22, 32);
+    memcpy(ml->old_node_pub, ml->wg_public_key, 32);    /* a stale OLD_PUB is overwritten */
+    ml->old_node_valid = true;
+    return ESP_OK;
 }
-void ml_identity_clear_old_node_key(microlink_t *ml) { (void)ml; }
+
+void ml_identity_clear_old_node_key(microlink_t *ml) {
+    stub_clear_calls++;
+    ml->old_node_valid = false;
+    memset(ml->old_node_pub, 0, sizeof(ml->old_node_pub));
+}
+
+/* Records ml_coord_cmd_t values sent to stub_cmd_queue; other queues are ignored. */
+void *stub_cmd_queue;
+int stub_cmd_sent;
+int stub_cmd_last = -1;
+BaseType_t shim_queue_send(QueueHandle_t q, const void *item) {
+    if (q != NULL && q == stub_cmd_queue) {
+        stub_cmd_sent++;
+        stub_cmd_last = *(const int *)item;
+        return pdTRUE;
+    }
+    return pdFALSE;
+}
 
 /* STUN is not part of the registration path. */
 esp_err_t ml_stun_resolve_servers(microlink_t *ml) { (void)ml; return ESP_FAIL; }

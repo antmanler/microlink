@@ -149,11 +149,22 @@ static void test_auth_url_getter(void) {
     const char *url = "https://example.invalid/a/placeholder";   /* 37 chars */
     char buf[64];
 
+    ml->state = ML_STATE_NEEDS_LOGIN;
     CHECK(microlink_copy_auth_url(ml, buf, sizeof(buf)) == ESP_ERR_NOT_FOUND);
     CHECK(microlink_get_auth_url_length(ml) == 0);
 
-    ml_set_auth_url(ml, url);
+    CHECK(ml_set_auth_url(ml, url) == ESP_OK);
     size_t n = strlen(url);
+
+    /* Offered only while a login is pending (L8), though the coord task still holds it. */
+    ml->state = ML_STATE_CONNECTING;
+    CHECK(microlink_copy_auth_url(ml, buf, sizeof(buf)) == ESP_ERR_NOT_FOUND);
+    CHECK(microlink_get_auth_url_length(ml) == 0);
+    CHECK(ml_auth_url_length(ml) == n);                       /* internal accessor: no state check */
+    CHECK(ml_auth_url_copy(ml, buf, sizeof(buf)) == ESP_OK && !strcmp(buf, url));
+    ml->state = ML_STATE_ERROR;
+    CHECK(microlink_copy_auth_url(ml, buf, sizeof(buf)) == ESP_ERR_NOT_FOUND);
+    ml->state = ML_STATE_NEEDS_LOGIN;
     CHECK(microlink_get_auth_url_length(ml) == n);
     CHECK(microlink_copy_auth_url(ml, buf, sizeof(buf)) == ESP_OK && !strcmp(buf, url));
 
@@ -170,11 +181,11 @@ static void test_auth_url_getter(void) {
     CHECK(microlink_copy_auth_url(ml, NULL, 8) == ESP_ERR_INVALID_ARG);
     CHECK(microlink_copy_auth_url(NULL, buf, sizeof(buf)) == ESP_ERR_INVALID_ARG);
 
-    ml_set_auth_url(ml, "https://example.invalid/a/other");      /* replacement */
+    CHECK(ml_set_auth_url(ml, "https://example.invalid/a/other") == ESP_OK);   /* replacement */
     CHECK(microlink_copy_auth_url(ml, buf, sizeof(buf)) == ESP_OK && !strcmp(buf, "https://example.invalid/a/other"));
-    ml_set_auth_url(ml, NULL);
+    CHECK(ml_set_auth_url(ml, NULL) == ESP_OK);
     CHECK(microlink_copy_auth_url(ml, buf, sizeof(buf)) == ESP_ERR_NOT_FOUND);
-    ml_set_auth_url(ml, "");
+    CHECK(ml_set_auth_url(ml, "") == ESP_OK);
     CHECK(microlink_get_auth_url_length(ml) == 0);
     free(ml);
 }
@@ -227,12 +238,57 @@ static void test_device_name_and_error(void) {
     free(ml);
 }
 
+extern void *stub_cmd_queue;
+extern int stub_cmd_sent, stub_cmd_last;
+
+/* microlink_retry() asks for ML_CMD_RETRY, and only from a retryable ERROR (M1). */
+static void test_retry(void) {
+    microlink_t *ml = new_ml("dev-1");
+    ml->coord_cmd_queue = (QueueHandle_t)ml;      /* any non-NULL handle the stub recognises */
+    stub_cmd_queue = ml->coord_cmd_queue;
+    stub_cmd_sent = 0;
+    stub_cmd_last = -1;
+
+    CHECK(microlink_retry(NULL) == ESP_ERR_INVALID_ARG);
+    ml->state = ML_STATE_CONNECTED;
+    CHECK(microlink_retry(ml) == ESP_ERR_INVALID_STATE);
+    ml->state = ML_STATE_NEEDS_LOGIN;
+    CHECK(microlink_retry(ml) == ESP_ERR_INVALID_STATE);
+    CHECK(stub_cmd_sent == 0);
+
+    ml->state = ML_STATE_ERROR;
+    microlink_error_t retryable[] = {ML_ERR_REGISTER_REJECTED, ML_ERR_TAILNET_LOCK, ML_ERR_NODE_KEY_EXPIRED,
+                                     ML_ERR_NETWORK, ML_ERR_PROTOCOL};
+    for (size_t i = 0; i < sizeof(retryable) / sizeof(retryable[0]); i++) {
+        ml->last_error = retryable[i];
+        stub_cmd_sent = 0;
+        CHECK(microlink_retry(ml) == ESP_OK);
+        CHECK(stub_cmd_sent == 1 && stub_cmd_last == (int)ML_CMD_RETRY);
+        CHECK(stub_cmd_last != (int)ML_CMD_FORCE_RECONNECT);
+    }
+
+    /* The restart-only categories are refused and send nothing. */
+    stub_cmd_sent = 0;
+    ml->last_error = ML_ERR_KEY_ROTATED;
+    CHECK(microlink_retry(ml) == ESP_ERR_INVALID_STATE);
+    ml->last_error = ML_ERR_STORAGE;
+    CHECK(microlink_retry(ml) == ESP_ERR_INVALID_STATE);
+    CHECK(stub_cmd_sent == 0);
+
+    /* A full queue is reported. */
+    stub_cmd_queue = NULL;
+    ml->last_error = ML_ERR_NETWORK;
+    CHECK(microlink_retry(ml) == ESP_ERR_TIMEOUT);
+    free(ml);
+}
+
 int main(void) {
     test_build_request();
     test_parse_response();
     test_auth_url_getter();
     test_self_name();
     test_device_name_and_error();
+    test_retry();
     printf("%d checks, %d failed\n", g_total, g_failed);
     return g_failed ? 1 : 0;
 }

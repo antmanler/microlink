@@ -1,6 +1,6 @@
 # Host harness for the interactive-login path (DESIGN section 10, probe P3).
 #
-#   make test    unit tests of the register codec and the login getters
+#   make test    unit tests of the register codec, the login getters and the coord decisions
 #   make probe   build the P3 probe
 #   make run     run the probe against the real control server (keyless register;
 #                prints states only, never the login URL)
@@ -38,11 +38,15 @@ $(OUT):
 $(OUT)/test_codec: $(HERE)/test_codec.c $(LIB_SRC) | $(OUT)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $(HERE)/test_codec.c $(LIB_SRC) $(LDLIBS)
 
+$(OUT)/test_coord: $(HERE)/test_coord.c $(ML)/src/ml_coord.c $(LIB_SRC) | $(OUT)
+	$(CC) $(CFLAGS) $(INCLUDES) -I$(ML)/src -o $@ $(HERE)/test_coord.c $(LIB_SRC) $(LDLIBS)
+
 $(OUT)/probe: $(HERE)/probe.c $(ML)/src/ml_coord.c $(LIB_SRC) | $(OUT)
 	$(CC) $(CFLAGS) $(INCLUDES) -I$(ML)/src -o $@ $(HERE)/probe.c $(LIB_SRC) $(LDLIBS)
 
-test: $(OUT)/test_codec
+test: $(OUT)/test_codec $(OUT)/test_coord
 	$(OUT)/test_codec
+	$(OUT)/test_coord
 
 probe: $(OUT)/probe
 

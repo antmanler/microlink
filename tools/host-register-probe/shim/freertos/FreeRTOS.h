@@ -47,6 +47,8 @@ static inline EventBits_t xEventGroupWaitBits(EventGroupHandle_t e, EventBits_t 
 static inline BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t t) {
     (void)q; (void)item; (void)t; return pdFALSE;
 }
+/* The harness records what is sent to the coord command queue (host_stubs.c). */
+BaseType_t shim_queue_send(QueueHandle_t q, const void *item);
 static inline BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t t) {
-    (void)q; (void)item; (void)t; return pdFALSE;
+    (void)t; return shim_queue_send(q, item);
 }
