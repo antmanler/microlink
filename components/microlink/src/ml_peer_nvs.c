@@ -165,16 +165,14 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
                 lru_idx = i;
             }
         }
-        ESP_LOGI(TAG, "LRU evict: %s (slot=%d lru=%d)",
-                 s_table->entries[lru_idx].hostname_short, lru_idx, min_lru);
+        ESP_LOGI(TAG, "LRU evict: slot=%d lru=%d", lru_idx, min_lru);
         s_table->entries[lru_idx] = entry;
         slot = lru_idx;
     }
 
     esp_err_t err = flush_table();
     if (err == ESP_OK) {
-        ESP_LOGD(TAG, "Saved peer %s (slot=%d/%d)",
-                 entry.hostname_short, slot, s_table->count);
+        ESP_LOGD(TAG, "Saved peer (slot=%d/%d)", slot, s_table->count);
     }
 
     return err;
@@ -213,9 +211,7 @@ int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
 
         loaded++;
 
-        char ip_str[16];
-        microlink_ip_to_str(p->vpn_ip, ip_str);
-        ESP_LOGI(TAG, "Loaded cached peer: %s (%s)", p->hostname, ip_str);
+        ESP_LOGD(TAG, "Loaded cached peer %d", loaded);
     }
 
     ESP_LOGI(TAG, "Loaded %d cached peers from NVS", loaded);

@@ -37,6 +37,10 @@ extern void wireguardif_network_rx(void *arg, struct udp_pcb *pcb,
 
 static const char *TAG = "ml_wg_mgr";
 
+/* Logs name a peer by its table slot, never by its tailnet host name or endpoint
+ * address: serial captures must hold states and sizes only. Needs `ml` in scope. */
+#define PEER_SLOT(p) ((int)((p) - ml->peers))
+
 /* Forward declarations */
 static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx);
 static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force);
@@ -131,15 +135,8 @@ static err_t wg_derp_output_cb(const uint8_t *peer_public_key,
     /* Log WG handshake initiations with key and one-time hex dump */
     if (len >= 4 && data[0] == 0x01) {
         static int init_dump_count = 0;
-        const char *hostname = "?";
-        for (int i = 0; i < ml->peer_count; i++) {
-            if (memcmp(ml->peers[i].public_key, peer_public_key, 32) == 0) {
-                hostname = ml->peers[i].hostname;
-                break;
-            }
-        }
-        ESP_LOGI(TAG, "WG INIT -> %s len=%d key=%02x%02x%02x%02x%02x%02x%02x%02x",
-                 hostname, (int)len,
+        ESP_LOGI(TAG, "WG INIT len=%d key=%02x%02x%02x%02x%02x%02x%02x%02x",
+                 (int)len,
                  peer_public_key[0], peer_public_key[1],
                  peer_public_key[2], peer_public_key[3],
                  peer_public_key[4], peer_public_key[5],
@@ -213,17 +210,13 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
     if (!ml) return ERR_CONN;
 
     /* Log WG packets sent via direct UDP */
-    uint32_t ip_host = ntohl(dest_ip);
     /* [ambient-mod][diagnostic] Print the **caller's task**. This line exposed the
      * root cause: the field logs contained both `[task=ml_wg_mgr]` for handshakes
      * and keepalives and tcpip_thread in the data-packet backtrace, proving that
      * two tasks were calling the same raw lwIP API. **Keep this as a regression
      * signal after the fix**: the direct-send path should show only tcpip_thread. */
-    ESP_LOGI(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d [task=%s]",
+    ESP_LOGI(TAG, "WG UDP TX: %d bytes type=%d [task=%s]",
              (int)len,
-             (int)((ip_host >> 24) & 0xFF), (int)((ip_host >> 16) & 0xFF),
-             (int)((ip_host >> 8) & 0xFF), (int)(ip_host & 0xFF),
-             (int)dest_port,
              len >= 1 ? data[0] : -1,
              pcTaskGetName(NULL));
 
@@ -464,7 +457,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Check if peer already exists */
     int idx = find_peer_by_key(ml, update->public_key);
     if (idx >= 0) {
-        ESP_LOGI(TAG, "Updating existing peer %s (idx=%d)", update->hostname, idx);
+        ESP_LOGI(TAG, "Updating existing peer (idx=%d)", idx);
     } else {
         /* Find free slot */
         idx = -1;
@@ -494,8 +487,8 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
             if (evict_idx >= 0) {
                 char evict_ip[16];
                 microlink_ip_to_str(ml->peers[evict_idx].vpn_ip, evict_ip);
-                ESP_LOGW(TAG, "Evicting LRU peer %s (%s) for priority peer %s",
-                         ml->peers[evict_idx].hostname, evict_ip, update->hostname);
+                ESP_LOGW(TAG, "Evicting LRU peer idx=%d (%s) for the priority peer",
+                         evict_idx, evict_ip);
                 if (ml->peers[evict_idx].wg_peer_index >= 0 && ml->wg_netif) {
                     wireguardif_remove_peer((struct netif *)ml->wg_netif,
                                             ml->peers[evict_idx].wg_peer_index);
@@ -506,8 +499,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         }
 
         if (idx < 0) {
-            ESP_LOGW(TAG, "Peer table full (%d slots), cannot add %s",
-                     ML_MAX_PEERS, update->hostname);
+            ESP_LOGW(TAG, "Peer table full (%d slots), cannot add a peer", ML_MAX_PEERS);
             return -1;
         }
         if (idx >= ml->peer_count) {
@@ -545,8 +537,8 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 
     char ip_str[16];
     microlink_ip_to_str(update->vpn_ip, ip_str);
-    ESP_LOGI(TAG, "Peer added: %s (%s) idx=%d endpoints=%d derp=%d key=%02x%02x%02x%02x%02x%02x%02x%02x",
-             p->hostname, ip_str, idx, p->endpoint_count, p->derp_region,
+    ESP_LOGI(TAG, "Peer added: (%s) idx=%d endpoints=%d derp=%d key=%02x%02x%02x%02x%02x%02x%02x%02x",
+             ip_str, idx, p->endpoint_count, p->derp_region,
              p->public_key[0], p->public_key[1], p->public_key[2], p->public_key[3],
              p->public_key[4], p->public_key[5], p->public_key[6], p->public_key[7]);
 
@@ -680,7 +672,7 @@ static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
 
     char ip_str[16];
     microlink_ip_to_str(ml->peers[idx].vpn_ip, ip_str);
-    ESP_LOGI(TAG, "Peer removed: %s (%s)", ml->peers[idx].hostname, ip_str);
+    ESP_LOGI(TAG, "Peer removed: idx=%d (%s)", idx, ip_str);
 
     ml->peers[idx].active = false;
 
@@ -718,8 +710,8 @@ static void process_peer_updates(microlink_t *ml) {
                     if (update->derp_region > 0) {
                         p->derp_region = update->derp_region;
                     }
-                    ESP_LOGI(TAG, "Peer patched: %s (eps=%d derp=%d)",
-                             p->hostname, p->endpoint_count, p->derp_region);
+                    ESP_LOGI(TAG, "Peer patched: idx=%d (eps=%d derp=%d)",
+                             idx, p->endpoint_count, p->derp_region);
                 }
             }
             break;
@@ -773,8 +765,8 @@ static void disco_build_ping(microlink_t *ml, int peer_idx,
             pending_probes[i].sent_ms = ml_get_time_ms();
             pending_probes[i].active = true;
             registered = true;
-            ESP_LOGI(TAG, "Probe registered slot=%d peer=%s txid=%02x%02x%02x%02x",
-                     i, p->hostname, txid[0], txid[1], txid[2], txid[3]);
+            ESP_LOGI(TAG, "Probe registered slot=%d peer=%d txid=%02x%02x%02x%02x",
+                     i, PEER_SLOT(p), txid[0], txid[1], txid[2], txid[3]);
             break;
         }
     }
@@ -862,12 +854,7 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
                         p->endpoints[i].port == p->best_port) continue;
                     int ret = disco_udp_sendto(ml, pkt, pkt_len, p->endpoints[i].ip, p->endpoints[i].port);
                     if (!direct_sent) {  /* Log only first direct send per peer */
-                        ESP_LOGI(TAG, "  direct probe -> %d.%d.%d.%d:%d (%d eps, ret=%d)",
-                                 (int)((p->endpoints[i].ip >> 24) & 0xFF),
-                                 (int)((p->endpoints[i].ip >> 16) & 0xFF),
-                                 (int)((p->endpoints[i].ip >> 8) & 0xFF),
-                                 (int)(p->endpoints[i].ip & 0xFF),
-                                 (int)p->endpoints[i].port,
+                        ESP_LOGI(TAG, "  direct probe sent (%d eps, ret=%d)",
                                  p->endpoint_count, ret);
                     }
                     direct_sent = true;
@@ -875,9 +862,9 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
             }
         }
         if (!has_udp) {
-            ESP_LOGW(TAG, "  no UDP path for %s (sock4=%d)", p->hostname, ml->disco_sock4);
+            ESP_LOGW(TAG, "  no UDP path for peer %d (sock4=%d)", PEER_SLOT(p), ml->disco_sock4);
         } else if (!direct_sent && p->endpoint_count > 0) {
-            ESP_LOGW(TAG, "  %s: %d eps but none usable (all IPv6?)", p->hostname, p->endpoint_count);
+            ESP_LOGW(TAG, "  peer %d: %d eps but none usable (all IPv6?)", PEER_SLOT(p), p->endpoint_count);
         }
     }
 
@@ -886,13 +873,9 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
      * DERP pong stealing the probe match from the direct pong. */
     if (!p->has_direct_path || !direct_sent) {
         ml_derp_queue_send(ml, p->public_key, pkt, pkt_len);
-        ESP_LOGI(TAG, "DISCO PING -> %s via DERP", p->hostname);
+        ESP_LOGI(TAG, "DISCO PING -> peer %d via DERP", PEER_SLOT(p));
     } else {
-        ESP_LOGI(TAG, "DISCO PING -> %s via direct %d.%d.%d.%d:%d",
-                 p->hostname,
-                 (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
-                 (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
-                 (int)p->best_port);
+        ESP_LOGI(TAG, "DISCO PING -> peer %d via direct", PEER_SLOT(p));
     }
 
     p->last_ping_sent_ms = now;
@@ -915,8 +898,8 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
 
     ml_peer_t *p = &ml->peers[peer_idx];
 
-    ESP_LOGI(TAG, "DISCO PING from %s (via %s)",
-             p->hostname, pkt->via_derp ? "DERP" : "direct");
+    ESP_LOGI(TAG, "DISCO PING from peer %d (via %s)",
+             PEER_SLOT(p), pkt->via_derp ? "DERP" : "direct");
 
     /* Build PONG */
     uint8_t pong[256];
@@ -968,8 +951,8 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
     /* 3. ALWAYS send via DERP (guaranteed delivery, even if direct worked) */
     ml_derp_queue_send(ml, p->public_key, pong, pong_len);
 
-    ESP_LOGI(TAG, "PONG sent to %s (direct=%s, DERP=yes)",
-             p->hostname, direct_sent ? "yes" : "no");
+    ESP_LOGI(TAG, "PONG sent to peer %d (direct=%s, DERP=yes)",
+             PEER_SLOT(p), direct_sent ? "yes" : "no");
 }
 
 static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
@@ -995,8 +978,8 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
         ml_peer_t *p = &ml->peers[peer_idx];
         uint64_t rtt_ms = now - pending_probes[i].sent_ms;
 
-        ESP_LOGI(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
-                 p->hostname, (unsigned long long)rtt_ms,
+        ESP_LOGI(TAG, "DISCO PONG from peer %d: RTT=%llu ms (via %s)",
+                 PEER_SLOT(p), (unsigned long long)rtt_ms,
                  pkt->via_derp ? "DERP" : "direct");
 
         p->last_pong_recv_ms = now;
@@ -1033,10 +1016,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                     uint32_t new_ip_u32 = htonl(pkt->src_ip);
                     if (cur_ip_u32 != new_ip_u32 || cur_port != pkt->src_port) {
                         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                        ESP_LOGI(TAG, "WG endpoint SWITCHED to direct: %d.%d.%d.%d:%d for %s",
-                                 (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
-                                 (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
-                                 (int)pkt->src_port, p->hostname);
+                        ESP_LOGI(TAG, "WG endpoint SWITCHED to direct for peer %d", PEER_SLOT(p));
                     }
                 } else {
                     /* [ambient-mod] Diagnostic: ask the device's own table instead
@@ -1045,27 +1025,23 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                      * remote peer occupies two slots. Keep it. */
                     {
                         struct wireguard_device *dbg = (struct wireguard_device *)netif->state;
-                        ESP_LOGW(TAG, "  [peers] %s wants wg_idx=%d; device table:",
-                                 p->hostname, (int)p->wg_peer_index);
+                        ESP_LOGW(TAG, "  [peers] peer %d wants wg_idx=%d; device table:",
+                                 PEER_SLOT(p), (int)p->wg_peer_index);
                         if (dbg) {
                             for (int k = 0; k < WIREGUARD_MAX_PEERS; k++) {
                                 struct wireguard_peer *pp = &dbg->peers[k];
                                 if (!pp->valid) continue;
                                 ESP_LOGW(TAG, "    slot=%d active=%d curr_valid=%d prev_valid=%d "
-                                              "ep=%s:%u pub=%02x%02x%02x%02x",
+                                              "via=%s pub=%02x%02x%02x%02x",
                                          k, (int)pp->active, (int)pp->curr_keypair.valid,
                                          (int)pp->prev_keypair.valid,
-                                         ip_addr_isany(&pp->ip) ? "DERP" : ipaddr_ntoa(&pp->ip),
-                                         (unsigned)pp->port,
+                                         ip_addr_isany(&pp->ip) ? "DERP" : "direct",
                                          pp->public_key[0], pp->public_key[1],
                                          pp->public_key[2], pp->public_key[3]);
                             }
                         }
                     }
-                    ESP_LOGI(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
-                             (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
-                             (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
-                             (int)pkt->src_port, p->hostname);
+                    ESP_LOGI(TAG, "WG endpoint stored (no session) for peer %d", PEER_SLOT(p));
                     /* First direct path discovery — send a one-shot handshake
                      * via direct UDP. Do NOT use wireguardif_connect() which
                      * sets peer->active=true and causes infinite handshake
@@ -1088,7 +1064,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                          * peer may initiate a session. Clearing it means no session
                          * can ever be established. Field evidence: all 12 device
                          * peer slots had active=0/curr_valid=0. See the patch header. */
-                        ESP_LOGI(TAG, "WG one-shot handshake to %s (first direct path)", p->hostname);
+                        ESP_LOGI(TAG, "WG one-shot handshake to peer %d (first direct path)", PEER_SLOT(p));
                     }
                 }
             }
@@ -1102,13 +1078,12 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
     if (!matched) {
         /* Find peer by disco key for logging */
         int peer_idx = find_peer_by_disco_key(ml, sender_disco_key);
-        const char *name = peer_idx >= 0 ? ml->peers[peer_idx].hostname : "?";
         int active_count = 0;
         for (int i = 0; i < MAX_PENDING_PROBES; i++) {
             if (pending_probes[i].active) active_count++;
         }
-        ESP_LOGW(TAG, "DISCO PONG unmatched from %s (via %s) txid=%02x%02x%02x%02x, active_probes=%d",
-                 name, pkt->via_derp ? "DERP" : "direct",
+        ESP_LOGW(TAG, "DISCO PONG unmatched from peer %d (via %s) txid=%02x%02x%02x%02x, active_probes=%d",
+                 peer_idx, pkt->via_derp ? "DERP" : "direct",
                  txid[0], txid[1], txid[2], txid[3], active_count);
     }
 }
@@ -1173,8 +1148,8 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
             size_t ep_data_len = plaintext_len - 2;
             int ep_count = ep_data_len / 18;
 
-            ESP_LOGI(TAG, "CallMeMaybe from %s: %d endpoints (udp_path=%d, at_sock=%d)",
-                     ml->peers[peer_idx].hostname, ep_count,
+            ESP_LOGI(TAG, "CallMeMaybe from peer %d: %d endpoints (udp_path=%d, at_sock=%d)",
+                     peer_idx, ep_count,
                      disco_has_udp_path(ml), ml_at_socket_is_ready());
 
             /* Reply with our own CallMeMaybe (bidirectional NAT traversal).
@@ -1218,10 +1193,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
                     if (ping_len > 0) {
                         int ret = disco_udp_sendto(ml, ping_pkt, ping_len, ip, port);
-                        ESP_LOGI(TAG, "CMM probe -> %d.%d.%d.%d:%d (%d bytes, ret=%d)",
-                                 (int)((ip >> 24) & 0xFF), (int)((ip >> 16) & 0xFF),
-                                 (int)((ip >> 8) & 0xFF), (int)(ip & 0xFF),
-                                 (int)port, (int)ping_len, ret);
+                        ESP_LOGI(TAG, "CMM probe sent (%d bytes, ret=%d)", (int)ping_len, ret);
                     }
                 } else {
                     ESP_LOGW(TAG, "CMM probe skipped: no UDP path (sock4=%d)", ml->disco_sock4);
@@ -1363,7 +1335,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     }
 
     if (ep_count == 0) {
-        ESP_LOGW(TAG, "CMM: no endpoints available for %s", p->hostname);
+        ESP_LOGW(TAG, "CMM: no endpoints available for peer %d", PEER_SLOT(p));
         return;
     }
 
@@ -1387,9 +1359,9 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     /* Send via DERP */
     esp_err_t err = ml_derp_queue_send(ml, p->public_key, pkt, pos);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "CallMeMaybe sent to %s (%d endpoints)", p->hostname, ep_count);
+        ESP_LOGI(TAG, "CallMeMaybe sent to peer %d (%d endpoints)", PEER_SLOT(p), ep_count);
     } else {
-        ESP_LOGW(TAG, "CallMeMaybe send failed for %s: %d", p->hostname, err);
+        ESP_LOGW(TAG, "CallMeMaybe send failed for peer %d: %d", PEER_SLOT(p), err);
     }
 }
 
@@ -1434,7 +1406,7 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
 
     /* Path 1: DERP (reliable fallback) */
     wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
-    ESP_LOGI(TAG, "WG handshake triggered (DERP) to %s", p->hostname);
+    ESP_LOGI(TAG, "WG handshake triggered (DERP) to peer %d", PEER_SLOT(p));
 
     /* Path 2: Direct UDP (if DISCO has a known endpoint).
      * This wakes the peer's magicsock via receiveIPv4 → noteRecvActivity.
@@ -1447,11 +1419,7 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
         wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
                                      &ep_ip, p->best_port);
         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-        ESP_LOGI(TAG, "WG handshake triggered (direct) to %s at %d.%d.%d.%d:%d",
-                 p->hostname,
-                 (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
-                 (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
-                 (int)p->best_port);
+        ESP_LOGI(TAG, "WG handshake triggered (direct) to peer %d", PEER_SLOT(p));
     }
 
     return ESP_OK;
@@ -1473,10 +1441,9 @@ bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
         if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
             struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
             bool key_match = (memcmp(wp->public_key, p->public_key, 32) == 0);
-            ESP_LOGI(TAG, "WG peer UP: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x %s",
-                     p->hostname, p->wg_peer_index,
-                     ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
-                     cur_port,
+            ESP_LOGI(TAG, "WG peer UP: peer %d wg_idx=%d via=%s key=%02x%02x%02x%02x %s",
+                     PEER_SLOT(p), p->wg_peer_index,
+                     ip_addr_isany(&cur_ip) ? "DERP" : "direct",
                      wp->public_key[0], wp->public_key[1],
                      wp->public_key[2], wp->public_key[3],
                      key_match ? "KEY_OK" : "KEY_MISMATCH!");
@@ -1529,7 +1496,7 @@ static void disco_periodic_probes(microlink_t *ml) {
 
         /* Check if direct path trust has expired (always runs, not throttled) */
         if (p->has_direct_path && now > p->trust_until_ms) {
-            ESP_LOGI(TAG, "Direct path to %s expired, reverting to DERP", p->hostname);
+            ESP_LOGI(TAG, "Direct path to peer %d expired, reverting to DERP", PEER_SLOT(p));
             p->has_direct_path = false;
 
             /* Only do DERP fallback + re-probe for allowed peers.
@@ -1542,7 +1509,7 @@ static void disco_periodic_probes(microlink_t *ml) {
                                                            NULL, NULL);
                     if (is_up == ERR_OK) {
                         wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
-                        ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
+                        ESP_LOGI(TAG, "  WG session active, falling back to DERP for peer %d", PEER_SLOT(p));
                     }
                 }
 
