@@ -77,12 +77,15 @@ typedef enum {
 typedef enum {
     ML_ERR_NONE = 0,
     ML_ERR_NETWORK,             /* control plane unreachable or timed out (retried automatically) */
-    ML_ERR_PROTOCOL,            /* empty or malformed control response (retried automatically) */
+    ML_ERR_PROTOCOL,            /* empty, malformed or unusable control response, or (interactive)
+                                 * a full netmap without the node's own entry (retried automatically) */
     ML_ERR_REGISTER_REJECTED,   /* RegisterResponse.Error: bad, used or expired auth key; login
-                                 * denied or expired. Terminal: call microlink_retry(). */
+                                 * denied or expired; a login URL offered to a caller that passed an
+                                 * auth key. Terminal: call microlink_retry(). */
     ML_ERR_TAILNET_LOCK,        /* tailnet lock is enabled: unsupported. Terminal. */
-    ML_ERR_KEY_ROTATED,         /* node key expired; a new key is stored. Terminal: reboot or
-                                 * destroy + init, then log in again. */
+    ML_ERR_KEY_ROTATED,         /* node key expired; a new key is stored and registered with
+                                 * OldNodeKey. Terminal for ALL callers, auth-key callers included:
+                                 * reboot or destroy + init (interactive callers then log in again). */
     ML_ERR_NODE_KEY_EXPIRED,    /* a freshly rotated key was reported expired again. Terminal. */
     ML_ERR_STORAGE,             /* NVS cannot hold the identity keys. Terminal. */
 } microlink_error_t;
@@ -203,6 +206,11 @@ esp_err_t microlink_retry(microlink_t *ml);
  * The URL is a login capability: whoever opens it can attach this device to
  * their own tailnet. It is kept in RAM only, never logged, and wiped when the
  * login finishes or the handle is destroyed.
+ *
+ * Log hygiene: the core files log states and sizes only. The optional files behind
+ * CONFIG_ML_ENABLE_NET_SWITCH, CONFIG_ML_ENABLE_CONFIG_HTTPD and CONFIG_ML_ENABLE_CELLULAR
+ * (ml_net_switch.c, ml_config_httpd.c, ml_cellular.c, ml_at_socket.c) still log SSIDs,
+ * names and addresses; keep them off where logs leave the device (see README).
  */
 esp_err_t microlink_copy_auth_url(const microlink_t *ml, char *buf, size_t len);
 

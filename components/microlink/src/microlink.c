@@ -7,6 +7,7 @@
  */
 
 #include "microlink_internal.h"
+#include "ml_register.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"  /* [ambient-mod] PSRAM task stacks */
 #include "esp_random.h"
@@ -291,7 +292,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (ml->config.priority_peer_ip == 0 && strlen(CONFIG_ML_PRIORITY_PEER_IP) > 0) {
         ml->config.priority_peer_ip = microlink_parse_ip(CONFIG_ML_PRIORITY_PEER_IP);
         if (ml->config.priority_peer_ip) {
-            ESP_LOGI(TAG, "Priority peer from Kconfig: %s", CONFIG_ML_PRIORITY_PEER_IP);
+            ESP_LOGI(TAG, "Priority peer set from Kconfig");
         }
     }
 
@@ -352,9 +353,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         uint32_t nvs_pip = ml_config_get_priority_peer_ip(ml->config_httpd);
         if (nvs_pip > 0) {
             ml->config.priority_peer_ip = nvs_pip;
-            char pip_str[16];
-            microlink_ip_to_str(nvs_pip, pip_str);
-            ESP_LOGI(TAG, "Priority peer overridden from NVS: %s", pip_str);
+            ESP_LOGI(TAG, "Priority peer overridden from NVS");
         }
         const char *nvs_ctrl = ml_config_get_ctrl_host(ml->config_httpd);
         if (nvs_ctrl) {
@@ -685,14 +684,29 @@ void microlink_destroy(microlink_t *ml) {
 
 typedef enum { NVS_JOB_ROTATE, NVS_JOB_CLEAR_OLD } nvs_job_op_t;
 
+/* One job lives on the heap and belongs to the waiter. The helper writes `result` and
+ * gives `done` as its last act on the job, and the waiter blocks on `done` until then
+ * (no timeout), so the job outlives every write the helper makes. `done` is private to
+ * the job: no other code can wake the waiter early, unlike the task's own notification. */
 typedef struct {
     nvs_job_op_t op;
     uint8_t old_pub[32];
     uint8_t new_priv[32];
     uint8_t new_pub[32];
-    TaskHandle_t waiter;
+    SemaphoreHandle_t done;
     esp_err_t result;
 } nvs_job_t;
+
+static nvs_job_t *nvs_job_new(nvs_job_op_t op) {
+    /* Internal RAM: the helper's NVS calls run with the flash cache off. */
+    nvs_job_t *job = heap_caps_calloc(1, sizeof(*job), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (job) job->op = op;
+    return job;
+}
+
+static void nvs_job_free(nvs_job_t *job) {
+    if (job) ml_register_secure_free(job, sizeof(*job));   /* holds the new private key */
+}
 
 static esp_err_t nvs_job_run_now(const nvs_job_t *job) {
     nvs_handle_t nvs;
@@ -717,60 +731,58 @@ static esp_err_t nvs_job_run_now(const nvs_job_t *job) {
 
 static void nvs_job_task(void *arg) {
     nvs_job_t *job = (nvs_job_t *)arg;
-    TaskHandle_t waiter = job->waiter;
     job->result = nvs_job_run_now(job);
-    xTaskNotifyGive(waiter);   /* job may be gone after this */
+    xSemaphoreGive(job->done);         /* the waiter owns job and done from here on */
     vTaskDelete(NULL);
 }
 
 static esp_err_t nvs_job_run(nvs_job_t *job) {
-    job->waiter = xTaskGetCurrentTaskHandle();
     job->result = ESP_FAIL;
+    job->done = xSemaphoreCreateBinary();
+    if (!job->done) return ESP_ERR_NO_MEM;
     if (xTaskCreate(nvs_job_task, "ml_nvs", ML_TASK_WG_MGR_STACK, job,
                     ML_TASK_COORD_PRIO, NULL) != pdPASS) {
+        vSemaphoreDelete(job->done);
+        job->done = NULL;
         return ESP_ERR_NO_MEM;
     }
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    xSemaphoreTake(job->done, portMAX_DELAY);
+    vSemaphoreDelete(job->done);
+    job->done = NULL;
     return job->result;
 }
 
 esp_err_t ml_identity_rotate_node_key(microlink_t *ml, uint8_t new_priv[32], uint8_t new_pub[32]) {
     if (!ml || !new_priv || !new_pub) return ESP_ERR_INVALID_ARG;
-    if (ml->old_node_valid) return ESP_ERR_INVALID_STATE;   /* one rotation at a time */
 
-    nvs_job_t job = { .op = NVS_JOB_ROTATE };
-    memcpy(job.old_pub, ml->wg_public_key, 32);
-    generate_keypair(job.new_priv, job.new_pub);
+    /* A stale OLD_PUB (left by an earlier rotation whose clear failed) is simply
+     * overwritten: the key being replaced now is the one that matters. */
+    nvs_job_t *job = nvs_job_new(NVS_JOB_ROTATE);
+    if (!job) return ESP_ERR_NO_MEM;
+    memcpy(job->old_pub, ml->wg_public_key, 32);
+    generate_keypair(job->new_priv, job->new_pub);
 
-    esp_err_t err = nvs_job_run(&job);
+    esp_err_t err = nvs_job_run(job);
     if (err == ESP_OK) {
-        memcpy(new_priv, job.new_priv, 32);
-        memcpy(new_pub, job.new_pub, 32);
-        memcpy(ml->old_node_pub, job.old_pub, 32);
+        memcpy(new_priv, job->new_priv, 32);
+        memcpy(new_pub, job->new_pub, 32);
+        memcpy(ml->old_node_pub, job->old_pub, 32);
         ml->old_node_valid = true;
     }
-    memset(job.new_priv, 0, sizeof(job.new_priv));
+    nvs_job_free(job);
     return err;
 }
 
 void ml_identity_clear_old_node_key(microlink_t *ml) {
     if (!ml || !ml->old_node_valid) return;
-    nvs_job_t job = { .op = NVS_JOB_CLEAR_OLD };
-    if (nvs_job_run(&job) == ESP_OK) {
+    nvs_job_t *job = nvs_job_new(NVS_JOB_CLEAR_OLD);
+    if (!job) return;                  /* the key stays: harmless, see below */
+    if (nvs_job_run(job) == ESP_OK) {
         ml->old_node_valid = false;
         memset(ml->old_node_pub, 0, sizeof(ml->old_node_pub));
     }
+    nvs_job_free(job);
     /* On failure the key stays: the next register sends OldNodeKey again, which is harmless. */
-}
-
-esp_err_t microlink_retry(microlink_t *ml) {
-    if (!ml) return ESP_ERR_INVALID_ARG;
-    if (ml->state != ML_STATE_ERROR) return ESP_ERR_INVALID_STATE;
-    if (ml->last_error == ML_ERR_KEY_ROTATED || ml->last_error == ML_ERR_STORAGE) {
-        return ESP_ERR_INVALID_STATE;   /* the keys in RAM are stale or missing: restart */
-    }
-    ml_coord_cmd_t cmd = ML_CMD_FORCE_RECONNECT;
-    return xQueueSend(ml->coord_cmd_queue, &cmd, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 /* ============================================================================

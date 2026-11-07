@@ -21,13 +21,17 @@
  * Login URL and self name (coord task writes, app reads under id_lock)
  * ========================================================================== */
 
-void ml_set_auth_url(microlink_t *ml, const char *url_or_null) {
+/* Replace the stored login URL; NULL or "" clears it. If the new URL cannot be copied
+ * the old one is cleared as well and ESP_ERR_NO_MEM is returned: keeping a URL that is
+ * no longer the server's current one would show the user a dead link. */
+esp_err_t ml_set_auth_url(microlink_t *ml, const char *url_or_null) {
     char *copy = NULL;
+    esp_err_t ret = ESP_OK;
     if (url_or_null && url_or_null[0]) {
         size_t n = strlen(url_or_null);
         copy = malloc(n + 1);
-        if (!copy) return;
-        memcpy(copy, url_or_null, n + 1);
+        if (copy) memcpy(copy, url_or_null, n + 1);
+        else ret = ESP_ERR_NO_MEM;
     }
     portENTER_CRITICAL(&ml->id_lock);
     char *old = ml->auth_url;
@@ -38,6 +42,7 @@ void ml_set_auth_url(microlink_t *ml, const char *url_or_null) {
         for (size_t i = strlen(old); i > 0; i--) v[i - 1] = 0;   /* the URL is a login capability */
         free(old);
     }
+    return ret;
 }
 
 void ml_set_self_fqdn(microlink_t *ml, const char *fqdn) {
@@ -61,7 +66,8 @@ static esp_err_t copy_out(char *buf, size_t buf_len, const char *src, size_t src
     return ESP_OK;
 }
 
-esp_err_t microlink_copy_auth_url(const microlink_t *ml, char *buf, size_t len) {
+/* Coord-task access: the URL regardless of the published state. */
+esp_err_t ml_auth_url_copy(const microlink_t *ml, char *buf, size_t len) {
     if (!ml || !buf || len == 0) return ESP_ERR_INVALID_ARG;
     portMUX_TYPE *lock = (portMUX_TYPE *)&ml->id_lock;
     esp_err_t ret = ESP_ERR_NOT_FOUND;
@@ -71,7 +77,7 @@ esp_err_t microlink_copy_auth_url(const microlink_t *ml, char *buf, size_t len) 
     return ret;
 }
 
-size_t microlink_get_auth_url_length(const microlink_t *ml) {
+size_t ml_auth_url_length(const microlink_t *ml) {
     if (!ml) return 0;
     portMUX_TYPE *lock = (portMUX_TYPE *)&ml->id_lock;
     size_t n = 0;
@@ -79,6 +85,18 @@ size_t microlink_get_auth_url_length(const microlink_t *ml) {
     if (ml->auth_url) n = strlen(ml->auth_url);
     portEXIT_CRITICAL(lock);
     return n;
+}
+
+/* Public: a URL is offered only while a login is pending (ML_STATE_NEEDS_LOGIN). */
+esp_err_t microlink_copy_auth_url(const microlink_t *ml, char *buf, size_t len) {
+    if (!ml || !buf || len == 0) return ESP_ERR_INVALID_ARG;
+    if (ml->state != ML_STATE_NEEDS_LOGIN) return ESP_ERR_NOT_FOUND;
+    return ml_auth_url_copy(ml, buf, len);
+}
+
+size_t microlink_get_auth_url_length(const microlink_t *ml) {
+    if (!ml || ml->state != ML_STATE_NEEDS_LOGIN) return 0;
+    return ml_auth_url_length(ml);
 }
 
 const char *ml_device_name(const microlink_t *ml) {
@@ -120,4 +138,16 @@ esp_err_t microlink_copy_magicdns_suffix(const microlink_t *ml, char *buf, size_
 
 microlink_error_t microlink_get_error(const microlink_t *ml) {
     return ml ? ml->last_error : ML_ERR_NONE;
+}
+
+esp_err_t microlink_retry(microlink_t *ml) {
+    if (!ml) return ESP_ERR_INVALID_ARG;
+    if (ml->state != ML_STATE_ERROR) return ESP_ERR_INVALID_STATE;
+    if (ml->last_error == ML_ERR_KEY_ROTATED || ml->last_error == ML_ERR_STORAGE) {
+        return ESP_ERR_INVALID_STATE;   /* the keys in RAM are stale or missing: restart */
+    }
+    /* Not FORCE_RECONNECT: microlink_rebind() and DERP failures send that one, and it
+     * must never clear a terminal error. */
+    ml_coord_cmd_t cmd = ML_CMD_RETRY;
+    return xQueueSend(ml->coord_cmd_queue, &cmd, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }

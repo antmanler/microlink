@@ -106,30 +106,37 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
     return 0;
 }
 
+/* Negative return codes of coord_recv() and noise_recv(). The caller decides on
+ * these, never on errno: a stale EAGAIN must not turn a dead stream into "idle". */
+enum {
+    COORD_RECV_FATAL = -1,  /* closed, failed, or a partial read left the stream misaligned */
+    COORD_RECV_IDLE  = -2,  /* nothing consumed: the receive timeout expired before the first byte */
+};
+
 static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
     size_t recvd = 0;
     int retries = 0;
     while (recvd < len) {
         int n = ml_recv(ml->coord_sock, buf + recvd, len - recvd, 0);
-        if (n <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (recvd == 0) {
-                    /* No data consumed yet — timeout is fine, caller can retry */
-                    return -1;
-                }
-                /* Partial data consumed — we MUST finish this read or the
-                 * Noise frame stream will be misaligned. Retry with backoff. */
-                if (++retries > 300) {  /* ~3 seconds */
-                    ESP_LOGE(TAG, "coord_recv partial timeout: %d/%d bytes",
-                             (int)recvd, (int)len);
-                    return -1;
-                }
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (recvd == 0) {
+                /* No data consumed yet: a timeout is fine, the caller can retry */
+                return COORD_RECV_IDLE;
             }
+            /* Partial data consumed: we MUST finish this read or the Noise frame
+             * stream is misaligned. Retry with backoff. */
+            if (++retries > 300) {  /* ~3 seconds */
+                ESP_LOGE(TAG, "coord_recv partial timeout: %d/%d bytes",
+                         (int)recvd, (int)len);
+                return COORD_RECV_FATAL;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (n <= 0) {   /* 0 = peer closed, <0 = socket error */
             ESP_LOGE(TAG, "coord_recv failed: %d (errno %d, recvd %d/%d)",
-                     n, errno, (int)recvd, (int)len);
-            return -1;
+                     n, n < 0 ? errno : 0, (int)recvd, (int)len);
+            return COORD_RECV_FATAL;
         }
         recvd += n;
         retries = 0;  /* Reset on successful read */
@@ -166,42 +173,46 @@ static int noise_send(microlink_t *ml, ml_noise_state_t *noise,
     return ret;
 }
 
-/* Receive and decrypt a Noise transport frame, returns plaintext length */
+/* Receive and decrypt a Noise transport frame.
+ * Returns the plaintext length (>= 0), COORD_RECV_IDLE when nothing was consumed
+ * (receive timeout, the stream is still aligned), or COORD_RECV_FATAL: the
+ * connection is unusable and must be dropped. */
 static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
                         uint8_t *plaintext, size_t max_len) {
     /* Read 3-byte frame header */
     uint8_t hdr[3];
-    if (coord_recv(ml, hdr, 3) < 0) return -1;
+    int r = coord_recv(ml, hdr, 3);
+    if (r < 0) return r;
 
+    /* From here on bytes are consumed: every failure leaves the stream misaligned. */
     if (hdr[0] != 0x04) {
         ESP_LOGE(TAG, "Unexpected Noise frame type: 0x%02x", hdr[0]);
-        return -1;
+        return COORD_RECV_FATAL;
     }
 
     uint16_t ct_len = (hdr[1] << 8) | hdr[2];
-    if (ct_len < 16) return -1;
+    if (ct_len < 16) return COORD_RECV_FATAL;
     size_t pt_len = ct_len - 16;
     if (pt_len > max_len) {
         ESP_LOGE(TAG, "Noise frame too large: %d > %d", (int)pt_len, (int)max_len);
-        return -1;
+        return COORD_RECV_FATAL;
     }
 
     uint8_t *ciphertext = ml_psram_malloc(ct_len);
-    if (!ciphertext) return -1;
+    if (!ciphertext) return COORD_RECV_FATAL;
 
-    /* Header already consumed — payload read MUST complete or stream
-     * alignment is permanently lost. Retry EAGAIN (coord_recv returns -1
-     * with errno==EAGAIN if recvd==0 on first byte). */
+    /* Header already consumed: the payload read MUST complete. A timeout before its
+     * first byte is retried; a partial payload is fatal (coord_recv says so). */
     int payload_retries = 0;
-    while (coord_recv(ml, ciphertext, ct_len) < 0) {
-        if ((errno == EAGAIN || errno == EWOULDBLOCK) && ++payload_retries <= 300) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d retries=%d errno=%d",
-                 ct_len, payload_retries, errno);
+    while ((r = coord_recv(ml, ciphertext, ct_len)) == COORD_RECV_IDLE) {
+        if (++payload_retries > 300) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (r < 0) {
+        ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d retries=%d",
+                 ct_len, payload_retries);
         free(ciphertext);
-        return -1;
+        return COORD_RECV_FATAL;
     }
 
     if (ml_noise_decrypt(noise->rx_key, noise->rx_nonce,
@@ -210,7 +221,7 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
                           plaintext) != ESP_OK) {
         ESP_LOGE(TAG, "Noise decrypt failed (nonce=%llu)", (unsigned long long)noise->rx_nonce);
         free(ciphertext);
-        return -1;
+        return COORD_RECV_FATAL;
     }
     noise->rx_nonce++;
 
@@ -908,13 +919,13 @@ static int register_read(microlink_t *ml, ml_noise_state_t *noise, reg_stream_t 
 
         int frame_len = noise_recv(ml, noise, frame_buf, ML_REG_FRAME_BUF_SIZE);
         if (frame_len <= 0) {
-            free(frame_buf);
+            ml_register_secure_free(frame_buf, ML_REG_FRAME_BUF_SIZE);
             *err = ML_ERR_NETWORK;    /* receive timeout or connection closed */
             return -1;
         }
         ESP_LOGI(TAG, "RegisterResponse Noise frame %d: %d bytes", i, frame_len);
         reg_stream_feed(ml, noise, rs, frame_buf, frame_len);
-        free(frame_buf);
+        ml_register_secure_free(frame_buf, ML_REG_FRAME_BUF_SIZE);   /* may hold the AuthURL */
     }
     if (rs->overflow) { *err = ML_ERR_PROTOCOL; return -1; }
     if (rs->reset) { *err = ML_ERR_NETWORK; return -1; }
@@ -941,16 +952,15 @@ static int register_poll(microlink_t *ml, ml_noise_state_t *noise, reg_stream_t 
     if (!frame_buf) return 0;
 
     int frame_len = noise_recv(ml, noise, frame_buf, ML_REG_FRAME_BUF_SIZE);
-    if (frame_len <= 0) {
-        int saved_errno = errno;
-        free(frame_buf);
-        if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) return 0;
-        *err = ML_ERR_NETWORK;
+    if (frame_len < 0) {
+        ml_register_secure_free(frame_buf, ML_REG_FRAME_BUF_SIZE);
+        if (frame_len == COORD_RECV_IDLE) return 0;      /* nothing consumed: still aligned */
+        *err = ML_ERR_NETWORK;                           /* fatal: drop the connection */
         return -1;
     }
 
     reg_stream_feed(ml, noise, rs, frame_buf, frame_len);
-    free(frame_buf);
+    ml_register_secure_free(frame_buf, ML_REG_FRAME_BUF_SIZE);       /* may hold the AuthURL */
 
     if (rs->overflow) { *err = ML_ERR_PROTOCOL; return -1; }
     if (rs->reset) { *err = ML_ERR_NETWORK; return -1; }
@@ -1617,9 +1627,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
                         unsigned a, b, c, d;
                         if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
                             ml->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                            char ip_str[16];
-                            microlink_ip_to_str(ml->vpn_ip, ip_str);
-                            ESP_LOGI(TAG, "Our VPN IP: %s", ip_str);
+                            ESP_LOGI(TAG, "Our VPN IP set");
                         }
                     }
                 }
@@ -1682,6 +1690,14 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
             }
 
             apply_self_node(ml, node, false);
+        } else if (ml->interactive) {
+            /* Approval and the node's own name come from the self node (DESIGN section
+             * 7.3). A full netmap without one cannot be read as "approved". */
+            ESP_LOGE(TAG, "MapResponse has no self node");
+            ml->last_error = ML_ERR_PROTOCOL;
+            cJSON_Delete(map_json);
+            free(resp_buf);
+            return -1;
         }
     }
 
@@ -1967,8 +1983,12 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     return 0;
 }
 
-/* Try to read one incremental MapResponse update (non-blocking) */
-static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
+/* Try to read one incremental MapResponse update (non-blocking).
+ * Returns 1 for data, 0 for nothing, -1 when the connection is unusable.
+ * This reads one Noise frame only. *map_unparsed (optional) is set when that frame
+ * ended inside an H2 frame or its stream-5 JSON did not parse: a netmap update was
+ * seen but not read, which matters while waiting for machine approval. */
+static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise, bool *map_unparsed) {
     /* Use select() to check if data is available before blocking in recv */
     fd_set readfds;
     FD_ZERO(&readfds);
@@ -1988,10 +2008,8 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 
     if (frame_len <= 0) {
         free(frame_buf);
-        int saved_errno = errno;
-        /* EAGAIN/EWOULDBLOCK = no data yet = not an error */
-        if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) return 0;
-        return frame_len;  /* Real error or connection closed */
+        /* Idle (or an empty frame) = no data yet = not an error; fatal = drop the connection */
+        return frame_len == COORD_RECV_FATAL ? -1 : 0;
     }
 
     /* Extract DATA frame payload from H2 frames, track flow control */
@@ -2009,7 +2027,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                              (frame_buf[pos + 7] << 8) | frame_buf[pos + 8];
         pos += 9;
 
-        if (pos + (int)f_len > frame_len) break;
+        if (pos + (int)f_len > frame_len) break;     /* frame continues in the next Noise frame */
 
         if (f_type == 0x00) {  /* DATA frame */
             total_data_bytes += f_len;
@@ -2041,6 +2059,10 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
         }
         pos += f_len;
     }
+    /* Anything left over is an H2 frame cut by the Noise frame boundary: it is dropped
+     * here, as it always was, but the caller may need to know. */
+    bool cut_frame = pos < frame_len;
+    if (cut_frame && map_unparsed) *map_unparsed = true;
 
     /* Send HTTP/2 WINDOW_UPDATE to replenish flow control after receiving DATA.
      * Without this, the server's send window exhausts and the connection stalls.
@@ -2077,6 +2099,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON *update_json = cJSON_Parse(parse_start);
     parse_start[parse_len] = saved;
 
+    if (!update_json && map_unparsed) *map_unparsed = true;
     if (update_json) {
         ESP_LOGI(TAG, "Long-poll MapResponse update received");
 
@@ -2124,12 +2147,12 @@ static void coord_drop_connection(microlink_t *ml, ml_noise_state_t *noise) {
  * polls it with register_poll(). Returns 0 or -1. */
 static int followup_open(microlink_t *ml, ml_noise_state_t *noise, reg_stream_t *rs,
                          uint32_t stream_id) {
-    size_t n = microlink_get_auth_url_length(ml);
+    size_t n = ml_auth_url_length(ml);
     if (n == 0 || !reg_stream_init(rs, stream_id)) return -1;
 
     char *url = ml_psram_malloc(n + 1);
     if (!url) { reg_stream_free(rs); return -1; }
-    if (microlink_copy_auth_url(ml, url, n + 1) != ESP_OK) {
+    if (ml_auth_url_copy(ml, url, n + 1) != ESP_OK) {
         ml_register_secure_free(url, n + 1);
         reg_stream_free(rs);
         return -1;
@@ -2156,25 +2179,93 @@ static bool auth_url_equals(microlink_t *ml, const char *url) {
     return eq;
 }
 
-/* The administrator approved this machine while the long-poll was already running:
- * do what COORD_FETCH_PEERS does for an approved node, minus the long-poll start. */
-static void coord_activate_after_approval(microlink_t *ml, ml_noise_state_t *noise) {
-    xEventGroupSetBits(ml->events, ML_EVT_COORD_REGISTERED);
-
-    if (!ml->derp.connected) {
-        xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
-        ESP_LOGI(TAG, "Waiting for DERP I/O task to connect...");
-        xEventGroupWaitBits(ml->events, ML_EVT_DERP_CONNECTED,
-                            pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
+/* A login URL was issued. Interactive callers wait for the user (COORD_LOGIN_WAIT);
+ * a caller that passed an auth key has no way to show the URL, so its key was not
+ * accepted. Returns true when the task is now in COORD_LOGIN_WAIT. */
+static bool coord_begin_login(microlink_t *ml, ml_noise_state_t *noise, coord_state_t *state,
+                              const char *url) {
+    if (!ml->interactive) {
+        coord_fail(ml, noise, state, ML_ERR_REGISTER_REJECTED);
+        return false;
     }
-    if (ml->stun_public_ip != 0 || ml->stun_has_ipv6) {
-        do_send_endpoint_update(ml, noise);
+    if (ml_set_auth_url(ml, url) != ESP_OK) {
+        /* The URL could not be kept (and the previous one is gone): unusable response, retried. */
+        ml->last_error = ML_ERR_PROTOCOL;
+        *state = COORD_RECONNECTING;
+        return false;
     }
-
     ml->last_error = ML_ERR_NONE;
-    ml->state = ML_STATE_CONNECTED;
-    if (ml->state_cb) {
-        ml->state_cb(ml, ML_STATE_CONNECTED, ml->state_cb_data);
+    coord_publish_state(ml, ML_STATE_NEEDS_LOGIN);
+    *state = COORD_LOGIN_WAIT;
+    return true;
+}
+
+/* NodeKeyExpired in a register reply (DESIGN section 12). Always ends in ERROR:
+ *  - first expiry of this session: store a new node key, keep the machine key, register
+ *    it with OldNodeKey so the control plane links the two, then KEY_ROTATED (the keys in
+ *    RAM are stale: the caller restarts, for auth-key and interactive callers alike);
+ *  - a second expiry in the same session: the rotated key was refused as well, as
+ *    direct.go:861-865 does inside one call. The flag is per session, not the persisted
+ *    OldNodeKey, so a failed OLD_PUB clear never makes a later expiry terminal. */
+static void coord_handle_key_expired(microlink_t *ml, ml_noise_state_t *noise, coord_state_t *state) {
+    if (ml->rotated_this_session) {
+        coord_fail(ml, noise, state, ML_ERR_NODE_KEY_EXPIRED);
+        return;
+    }
+    uint8_t new_priv[32], new_pub[32];
+    if (ml_identity_rotate_node_key(ml, new_priv, new_pub) != ESP_OK) {
+        coord_fail(ml, noise, state, ML_ERR_STORAGE);
+        return;
+    }
+    ml->rotated_this_session = true;
+    ESP_LOGW(TAG, "Node key expired: new key stored, registering with OldNodeKey");
+
+    reg_params_t rp = {
+        .stream_id = 3,                 /* stream 1 carried the register that was refused */
+        .node_priv = new_priv,
+        .node_pub = new_pub,
+        .old_node_pub = ml->old_node_pub,
+        .followup = NULL,
+    };
+    ml_register_result_t rr;
+    microlink_error_t xerr;
+    if (register_exchange(ml, noise, &rp, &rr, &xerr) == 0) {
+        ml_register_result_clear(&rr);  /* an AuthURL, if any, is re-issued after the restart */
+    }
+    memset(new_priv, 0, sizeof(new_priv));
+    coord_fail(ml, noise, state, ML_ERR_KEY_ROTATED);
+}
+
+/* Apply one command from the app. FORCE_RECONNECT (microlink_rebind, DERP failure) never
+ * leaves a terminal error; only RETRY (microlink_retry) does. */
+static void coord_handle_command(microlink_t *ml, coord_state_t *state, ml_coord_cmd_t cmd) {
+    switch (cmd) {
+    case ML_CMD_CONNECT:
+        if (*state == COORD_IDLE) {
+            *state = COORD_STUN_PROBE;
+            ml->state = ML_STATE_CONNECTING;
+        }
+        break;
+    case ML_CMD_DISCONNECT:
+        if (ml->coord_sock >= 0) {
+            ml_close_sock(ml->coord_sock);
+            ml->coord_sock = -1;
+        }
+        *state = COORD_IDLE;
+        ml->state = ML_STATE_IDLE;
+        break;
+    case ML_CMD_FORCE_RECONNECT:
+        if (*state != COORD_FAILED) *state = COORD_RECONNECTING;
+        break;
+    case ML_CMD_RETRY:
+        if (*state == COORD_FAILED) {
+            ml->last_error = ML_ERR_NONE;
+            *state = COORD_RECONNECTING;
+        }
+        break;
+    case ML_CMD_UPDATE_ENDPOINTS:
+        /* TODO: Send endpoint update on existing H2 connection */
+        break;
     }
 }
 
@@ -2218,29 +2309,7 @@ void ml_coord_task(void *arg) {
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         /* Check for commands (non-blocking) */
         if (xQueueReceive(ml->coord_cmd_queue, &cmd, 0) == pdTRUE) {
-            switch (cmd) {
-            case ML_CMD_CONNECT:
-                if (state == COORD_IDLE) {
-                    state = COORD_STUN_PROBE;
-                    ml->state = ML_STATE_CONNECTING;
-                }
-                break;
-            case ML_CMD_DISCONNECT:
-                if (ml->coord_sock >= 0) {
-                    ml_close_sock(ml->coord_sock);
-                    ml->coord_sock = -1;
-                }
-                state = COORD_IDLE;
-                ml->state = ML_STATE_IDLE;
-                break;
-            case ML_CMD_FORCE_RECONNECT:
-                if (state == COORD_FAILED) ml->last_error = ML_ERR_NONE;   /* microlink_retry() */
-                state = COORD_RECONNECTING;
-                break;
-            case ML_CMD_UPDATE_ENDPOINTS:
-                /* TODO: Send endpoint update on existing H2 connection */
-                break;
-            }
+            coord_handle_command(ml, &state, cmd);
         }
 
         /* A command may have pulled us out of COORD_LOGIN_WAIT. */
@@ -2356,50 +2425,20 @@ void ml_coord_task(void *arg) {
 
                 case ML_REG_AUTH_URL:
                     /* Interactive login: keep the URL in RAM, publish NEEDS_LOGIN, then
-                     * wait for the user on a Followup request (COORD_LOGIN_WAIT). */
-                    ml_set_auth_url(ml, rr.auth_url);
-                    ml->last_error = ML_ERR_NONE;
-                    followup_sid = 3;               /* stream 1 carried this register */
-                    followup_repeats = 0;
-                    followup_not_before_ms = 0;
-                    followup_is_open = false;
-                    login_ping_ms = ml_get_time_ms();
-                    last_activity_ms = login_ping_ms;
-                    coord_publish_state(ml, ML_STATE_NEEDS_LOGIN);
-                    state = COORD_LOGIN_WAIT;
+                     * wait for the user on a Followup request (COORD_LOGIN_WAIT). An
+                     * auth-key caller cannot show the URL: its key was not accepted. */
+                    if (coord_begin_login(ml, &noise, &state, rr.auth_url)) {
+                        followup_sid = 3;           /* stream 1 carried this register */
+                        followup_repeats = 0;
+                        followup_not_before_ms = 0;
+                        followup_is_open = false;
+                        login_ping_ms = ml_get_time_ms();
+                        last_activity_ms = login_ping_ms;
+                    }
                     break;
 
                 case ML_REG_NODE_KEY_EXPIRED:
-                    if (ml->old_node_valid) {
-                        /* A key we just rotated is reported expired again (direct.go:862-863). */
-                        coord_fail(ml, &noise, &state, ML_ERR_NODE_KEY_EXPIRED);
-                        break;
-                    }
-                    {
-                        /* DESIGN section 12: new node key, same machine key, register with
-                         * OldNodeKey, then hand the restart to the caller. The new key is in
-                         * NVS before the register, so a power loss here changes nothing. */
-                        uint8_t new_priv[32], new_pub[32];
-                        if (ml_identity_rotate_node_key(ml, new_priv, new_pub) != ESP_OK) {
-                            coord_fail(ml, &noise, &state, ML_ERR_STORAGE);
-                            break;
-                        }
-                        ESP_LOGW(TAG, "Node key expired: new key stored, registering with OldNodeKey");
-                        reg_params_t rp2 = {
-                            .stream_id = 3,         /* stream 1 carried the first register */
-                            .node_priv = new_priv,
-                            .node_pub = new_pub,
-                            .old_node_pub = ml->old_node_pub,
-                            .followup = NULL,
-                        };
-                        ml_register_result_t rr2;
-                        microlink_error_t e2;
-                        if (register_exchange(ml, &noise, &rp2, &rr2, &e2) == 0) {
-                            ml_register_result_clear(&rr2);     /* the AuthURL is re-issued after restart */
-                        }
-                        memset(new_priv, 0, sizeof(new_priv));
-                        coord_fail(ml, &noise, &state, ML_ERR_KEY_ROTATED);
-                    }
+                    coord_handle_key_expired(ml, &noise, &state);
                     break;
 
                 case ML_REG_REJECTED:
@@ -2506,8 +2545,10 @@ void ml_coord_task(void *arg) {
                         if (backoff_ms > ML_CTRL_BACKOFF_MAX_MS) backoff_ms = ML_CTRL_BACKOFF_MAX_MS;
                         followup_repeats++;
                         followup_not_before_ms = now + backoff_ms;
+                    } else if (ml_set_auth_url(ml, fr.auth_url) != ESP_OK) {
+                        ml->last_error = ML_ERR_PROTOCOL;   /* unusable response; the old URL is gone */
+                        state = COORD_RECONNECTING;
                     } else {
-                        ml_set_auth_url(ml, fr.auth_url);
                         followup_repeats = 0;
                         followup_not_before_ms = 0;
                     }
@@ -2548,6 +2589,7 @@ void ml_coord_task(void *arg) {
             ml->machine_auth_known = false;     /* re-learned from this netmap's self node */
             if (do_fetch_peers(ml, &noise) < 0) {
                 ESP_LOGW(TAG, "MapRequest failed, will retry");
+                if (ml->last_error == ML_ERR_NONE) ml->last_error = ML_ERR_NETWORK;
                 ml_close_sock(ml->coord_sock);
                 ml->coord_sock = -1;
                 state = COORD_RECONNECTING;
@@ -2660,13 +2702,12 @@ void ml_coord_task(void *arg) {
                             ml->stun_nat_checked = true;
                             if (ml->stun_public_port != pub_port) {
                                 ml->nat_mapping_varies = true;
-                                ESP_LOGW(TAG, "Symmetric NAT detected: port %u vs %u "
-                                         "(direct connections unlikely)",
-                                         ml->stun_public_port, pub_port);
+                                ESP_LOGW(TAG, "Symmetric NAT detected "
+                                         "(direct connections unlikely)");
                             } else {
                                 ml->nat_mapping_varies = false;
-                                ESP_LOGI(TAG, "Cone NAT: port %u consistent "
-                                         "(direct connections possible)", pub_port);
+                                ESP_LOGI(TAG, "Cone NAT: port consistent "
+                                         "(direct connections possible)");
                             }
                         } else {
                             /* Periodic re-probe — update primary result */
@@ -2691,7 +2732,7 @@ void ml_coord_task(void *arg) {
                                 ml->stun_public_port = port6;
                             }
                             ml->stun_retry_count = 0;  /* Got a result, stop retrying */
-                            ESP_LOGI(TAG, "STUN IPv6 result obtained, port %u", port6);
+                            ESP_LOGI(TAG, "STUN IPv6 result obtained");
                             /* Trigger NAT type check if not done yet */
                             if (!ml->stun_nat_checked && ml->stun_fallback_ip) {
                                 ml_stun_send_probe_to(ml, ml->stun_fallback_ip,
@@ -2828,7 +2869,8 @@ void ml_coord_task(void *arg) {
                 }
 
                 /* Poll for streaming MapResponse updates */
-                int poll_ret = poll_map_update(ml, &noise);
+                bool map_unparsed = false;
+                int poll_ret = poll_map_update(ml, &noise, &map_unparsed);
                 if (poll_ret > 0) {
                     last_activity_ms = now;  /* Reset watchdog */
                 } else if (poll_ret < 0) {
@@ -2837,10 +2879,19 @@ void ml_coord_task(void *arg) {
                     break;
                 }
 
-                if (ml->state == ML_STATE_NEEDS_MACHINE_AUTH && ml->machine_authorized) {
-                    ESP_LOGI(TAG, "Machine approved");
-                    coord_activate_after_approval(ml, &noise);
-                    last_activity_ms = ml_get_time_ms();
+                if (ml->state == ML_STATE_NEEDS_MACHINE_AUTH &&
+                    (ml->machine_authorized || map_unparsed)) {
+                    /* The approval arrived, or a netmap update did that poll_map_update()
+                     * could not read (it takes one Noise frame; a big update spans several).
+                     * Either way the delta cannot be trusted to carry the whole netmap:
+                     * register again on a fresh connection and let FETCH_PEERS read the
+                     * full one, as after a Followup success. */
+                    ESP_LOGI(TAG, "%s: reading the full netmap on a new connection",
+                             ml->machine_authorized ? "Machine approved" : "Netmap update not parsed");
+                    coord_drop_connection(ml, &noise);
+                    ml->state = ML_STATE_CONNECTING;
+                    state = COORD_STUN_PROBE;
+                    break;
                 }
 
                 vTaskDelay(pdMS_TO_TICKS(50));

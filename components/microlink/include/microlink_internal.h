@@ -228,7 +228,8 @@ typedef enum {
     ML_CMD_CONNECT,             /* Start registration */
     ML_CMD_DISCONNECT,          /* Graceful disconnect */
     ML_CMD_UPDATE_ENDPOINTS,    /* Send endpoint update to control plane */
-    ML_CMD_FORCE_RECONNECT,     /* Force reconnection (after DERP failure, etc.) */
+    ML_CMD_FORCE_RECONNECT,     /* Force reconnection (after DERP failure, etc.); never clears ERROR */
+    ML_CMD_RETRY,               /* microlink_retry(): leave a retryable ERROR and reconnect */
 } ml_coord_cmd_t;
 
 /* Peer update (from coord to wg_mgr) */
@@ -450,6 +451,7 @@ struct microlink_s {
     volatile bool machine_authorized;     /* SelfNode.MachineAuthorized (DESIGN section 7.3) */
     bool old_node_valid;            /* node key rotation pending: register carries OldNodeKey */
     uint8_t old_node_pub[32];       /* the expired node public key, persisted until re-registered */
+    bool rotated_this_session;      /* a node key was rotated since init: a second expiry is terminal */
 
     /* Resolved timing (set during init from config, 0 = default) */
     uint32_t t_disco_heartbeat_ms;
@@ -565,7 +567,9 @@ esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
 /* microlink.c: identity, login URL and self name (shared data takes id_lock) */
 esp_err_t ml_identity_rotate_node_key(microlink_t *ml, uint8_t new_priv[32], uint8_t new_pub[32]);
 void ml_identity_clear_old_node_key(microlink_t *ml);
-void ml_set_auth_url(microlink_t *ml, const char *url_or_null);
+esp_err_t ml_set_auth_url(microlink_t *ml, const char *url_or_null);   /* NULL clears; on ESP_ERR_NO_MEM the old URL is gone too */
+size_t ml_auth_url_length(const microlink_t *ml);                      /* no state check: coord use */
+esp_err_t ml_auth_url_copy(const microlink_t *ml, char *buf, size_t len);
 void ml_set_self_fqdn(microlink_t *ml, const char *fqdn);
 const char *ml_device_name(const microlink_t *ml);   /* Hostinfo.Hostname */
 

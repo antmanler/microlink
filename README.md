@@ -393,6 +393,30 @@ microlink_destroy(ml);
 microlink_factory_reset();
 ```
 
+### Interactive Login (no auth key)
+
+Leave `auth_key` NULL or empty and the node logs in through the control plane's own
+login page. The identity keys must persist, so NVS has to work (otherwise the handle is
+in `ML_STATE_ERROR` with `ML_ERR_STORAGE`).
+
+| State | What the app does |
+|---|---|
+| `ML_STATE_NEEDS_LOGIN` | show `microlink_copy_auth_url()` (e.g. as a QR code); the call fails with `ESP_ERR_INVALID_SIZE` rather than truncating |
+| `ML_STATE_NEEDS_MACHINE_AUTH` | logged in, an administrator must approve the machine |
+| `ML_STATE_CONNECTED` | done; `microlink_copy_self_fqdn()` / `microlink_copy_magicdns_suffix()` name the node |
+| `ML_STATE_ERROR` | read `microlink_get_error()`; `microlink_retry()` unless it is `ML_ERR_KEY_ROTATED` or `ML_ERR_STORAGE` (restart) |
+
+An expired node key is replaced (the machine key is kept) and registered with `OldNodeKey`;
+the stack then reports `ML_ERR_KEY_ROTATED`, and every caller, auth-key callers included,
+restarts. State callbacks run on the coord task: no NVS or flash calls from them.
+
+The login URL is a login capability. It is kept in RAM only and never logged. Logs carry
+states and sizes, not peer names, tailnet or public addresses, or key bytes. Not covered:
+`ml_net_switch.c` (`CONFIG_ML_ENABLE_NET_SWITCH`), `ml_config_httpd.c`
+(`CONFIG_ML_ENABLE_CONFIG_HTTPD`) and the cellular files `ml_cellular.c` / `ml_at_socket.c`
+(`CONFIG_ML_ENABLE_CELLULAR`) still log SSIDs, names and addresses; leave those options off
+where logs leave the device.
+
 ## Bidirectional UDP Communication
 
 MicroLink supports full bidirectional UDP communication over the Tailscale VPN. The ESP32 can both send and receive without waiting for a peer to initiate.

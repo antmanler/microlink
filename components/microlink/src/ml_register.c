@@ -31,6 +31,23 @@ static void key_to_str(const char *prefix, const uint8_t key[32], char *out, siz
     out[n + 64] = '\0';
 }
 
+/* The response tree holds the AuthURL and login names, the request tree the auth key:
+ * zero every string value before the allocator gets it back. */
+static void json_wipe(cJSON *item) {
+    for (; item; item = item->next) {
+        if (item->valuestring) {
+            volatile char *v = (volatile char *)item->valuestring;
+            for (size_t i = strlen(item->valuestring); i > 0; i--) v[i - 1] = 0;
+        }
+        json_wipe(item->child);
+    }
+}
+
+static void json_discard(cJSON *root) {
+    json_wipe(root);
+    cJSON_Delete(root);
+}
+
 char *ml_register_build_request(const ml_register_req_t *req) {
     if (!req || !req->node_pub || !req->hostname) return NULL;
 
@@ -82,7 +99,7 @@ char *ml_register_build_request(const ml_register_req_t *req) {
     }
 
     char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
+    json_discard(root);
     return json;
 }
 
@@ -116,7 +133,7 @@ ml_register_kind_t ml_register_parse_response(const uint8_t *body, size_t len,
 
     cJSON *resp = cJSON_ParseWithLength((const char *)body + start, len - start);
     if (!resp || !cJSON_IsObject(resp)) {
-        if (resp) cJSON_Delete(resp);
+        if (resp) json_discard(resp);
         out->kind = ML_REG_MALFORMED;
         return out->kind;
     }
@@ -138,7 +155,7 @@ ml_register_kind_t ml_register_parse_response(const uint8_t *body, size_t len,
             size_t n = strlen(url->valuestring);
             out->auth_url = malloc(n + 1);
             if (!out->auth_url) {
-                cJSON_Delete(resp);
+                json_discard(resp);
                 out->kind = ML_REG_MALFORMED;
                 return out->kind;
             }
@@ -149,7 +166,7 @@ ml_register_kind_t ml_register_parse_response(const uint8_t *body, size_t len,
         }
     }
 
-    cJSON_Delete(resp);
+    json_discard(resp);
     return out->kind;
 }
 
