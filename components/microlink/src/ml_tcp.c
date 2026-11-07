@@ -47,10 +47,7 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
         return NULL;
     }
 
-    char ip_str[16];
-    microlink_ip_to_str(dest_ip, ip_str);
-    ESP_LOGI(TAG, "TCP connect to %s:%u (timeout=%lums)", ip_str, dest_port,
-             (unsigned long)timeout_ms);
+    ESP_LOGI(TAG, "TCP connect (timeout=%lums)", (unsigned long)timeout_ms);
 
     /* Trigger WG handshake + DISCO to wake up the peer connection.
      * The tunnel may already be up if there's been recent traffic. */
@@ -106,9 +103,7 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
         if (bind(fd, (struct sockaddr *)&src, sizeof(src)) != 0) {
             ESP_LOGW(TAG, "bind() to VPN IP failed: errno=%d (continuing)", errno);
         } else {
-            char src_str[16];
-            microlink_ip_to_str(ml->vpn_ip, src_str);
-            ESP_LOGI(TAG, "TCP socket bound to VPN IP %s", src_str);
+            ESP_LOGI(TAG, "TCP socket bound to VPN IP");
         }
     }
 
@@ -150,7 +145,7 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
 
     if (connect(fd, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
         int err = errno;
-        ESP_LOGE(TAG, "connect() to %s:%u failed: errno=%d", ip_str, dest_port, err);
+        ESP_LOGE(TAG, "connect() failed: errno=%d", err);
 
         /* If tunnel wasn't ready, retry once after triggering handshake again */
         if (err == EHOSTUNREACH || err == ENETUNREACH || err == ETIMEDOUT) {
@@ -190,8 +185,7 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
     }
 
     int64_t t_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "TCP connected to %s:%u (%lld ms)", ip_str, dest_port,
-             (t_end - t_start) / 1000);
+    ESP_LOGI(TAG, "TCP connected (%lld ms)", (t_end - t_start) / 1000);
 
     /* Allocate handle */
     microlink_tcp_socket_t *sock = calloc(1, sizeof(microlink_tcp_socket_t));
@@ -277,9 +271,7 @@ void microlink_tcp_close(microlink_tcp_socket_t *sock) {
         sock->fd = -1;
     }
 
-    char ip_str[16];
-    microlink_ip_to_str(sock->peer_ip, ip_str);
-    ESP_LOGI(TAG, "TCP socket to %s:%u closed", ip_str, sock->peer_port);
+    ESP_LOGI(TAG, "TCP socket closed");
 
     sock->connected = false;
     free(sock);

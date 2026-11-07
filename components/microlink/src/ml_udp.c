@@ -204,9 +204,7 @@ microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_por
         sock->rx_task = NULL;
     }
 
-    char ip_buf[16];
-    microlink_ip_to_str(ml->vpn_ip, ip_buf);
-    ESP_LOGI(TAG, "UDP socket: %s:%u", ip_buf, sock->local_port);
+    ESP_LOGI(TAG, "UDP socket: local port %u", sock->local_port);
 
     /* Trigger CallMeMaybe to all peers for WG handshake establishment */
     for (int i = 0; i < ml->peer_count; i++) {

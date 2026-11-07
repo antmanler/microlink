@@ -415,9 +415,7 @@ bool ml_stun_parse_response(const uint8_t *data, size_t len,
                                   data[offset + 7];
                 *out_ip = xaddr ^ STUN_MAGIC_COOKIE;
 
-                char ip_str[16];
-                microlink_ip_to_str(*out_ip, ip_str);
-                ESP_LOGI(TAG, "STUN mapped: %s:%u", ip_str, *out_port);
+                ESP_LOGI(TAG, "STUN mapped address received");
                 txid_v4_valid = false;
                 return true;
             }
@@ -442,9 +440,7 @@ bool ml_stun_parse_response(const uint8_t *data, size_t len,
                       (data[offset + 6] << 8) |
                        data[offset + 7];
 
-            char ip_str[16];
-            microlink_ip_to_str(*out_ip, ip_str);
-            ESP_LOGI(TAG, "STUN mapped (legacy): %s:%u", ip_str, *out_port);
+            ESP_LOGI(TAG, "STUN mapped address received (legacy)");
             txid_v4_valid = false;
             return true;
         }

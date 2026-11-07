@@ -244,8 +244,7 @@ static int derp_send_packet(microlink_t *ml, const uint8_t *dest_key,
 
     int ret = derp_write_frame(ml, DERP_FRAME_SEND_PACKET, frame, frame_len);
     if (ret < 0) {
-        ESP_LOGW(TAG, "derp_send_packet FAILED: dest=%02x%02x%02x%02x len=%d",
-                 dest_key[0], dest_key[1], dest_key[2], dest_key[3], (int)len);
+        ESP_LOGW(TAG, "derp_send_packet FAILED: len=%d", (int)len);
     }
     free(frame);
     return ret;
@@ -299,9 +298,8 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
     switch (frame_type) {
     case DERP_FRAME_RECV_PACKET:
         if (payload) {
-            ESP_LOGI(TAG, "DERP RecvPacket: %d bytes from %02x%02x%02x%02x, hdr=%02x",
+            ESP_LOGI(TAG, "DERP RecvPacket: %d bytes, hdr=%02x",
                      (int)payload_len,
-                     src_key[0], src_key[1], src_key[2], src_key[3],
                      payload_len > 0 ? payload[0] : 0xFF);
             route_derp_packet(ml, payload, payload_len, src_key);
             return;  /* payload ownership transferred */
@@ -326,9 +324,7 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
 
     case DERP_FRAME_PEER_GONE:
         if (payload && payload_len >= 32) {
-            ESP_LOGI(TAG, "DERP PeerGone: %02x%02x%02x%02x (len=%d)",
-                     payload[0], payload[1], payload[2], payload[3],
-                     (int)payload_len);
+            ESP_LOGI(TAG, "DERP PeerGone (len=%d)", (int)payload_len);
         }
         break;
 
@@ -586,10 +582,8 @@ void ml_derp_tx_task(void *arg) {
                 }
                 int ret;
                 if (item.frame_type == DERP_FRAME_SEND_PACKET) {
-                    ESP_LOGI(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x",
-                             (int)item.len, item.dest_pubkey[0], item.dest_pubkey[1],
-                             item.dest_pubkey[2], item.dest_pubkey[3],
-                             item.data[0]);
+                    ESP_LOGI(TAG, "DERP TX: SendPacket %d bytes, hdr=%02x",
+                             (int)item.len, item.data[0]);
                     ret = derp_send_packet(ml, item.dest_pubkey, item.data, item.len);
                 } else {
                     ret = derp_write_frame(ml, item.frame_type, item.data, item.len);
@@ -955,11 +949,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         memcpy(ci_payload + 32 + NACL_BOX_NONCEBYTES, ciphertext, ciphertext_len);
         free(ciphertext);
 
-        ESP_LOGI(TAG, "DERP ClientInfo node_key=%02x%02x%02x%02x%02x%02x%02x%02x",
-                 ml->wg_public_key[0], ml->wg_public_key[1],
-                 ml->wg_public_key[2], ml->wg_public_key[3],
-                 ml->wg_public_key[4], ml->wg_public_key[5],
-                 ml->wg_public_key[6], ml->wg_public_key[7]);
+        ESP_LOGI(TAG, "DERP ClientInfo sent");
 
         /* Send ClientInfo frame */
         if (derp_write_frame(ml, DERP_FRAME_CLIENT_INFO, ci_payload, ci_payload_len) < 0) {

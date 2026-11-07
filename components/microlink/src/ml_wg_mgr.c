@@ -132,38 +132,9 @@ static err_t wg_derp_output_cb(const uint8_t *peer_public_key,
         return ERR_CONN;
     }
 
-    /* Log WG handshake initiations with key and one-time hex dump */
+    /* Log WG handshake initiations: size only, no key or handshake bytes */
     if (len >= 4 && data[0] == 0x01) {
-        static int init_dump_count = 0;
-        ESP_LOGI(TAG, "WG INIT len=%d key=%02x%02x%02x%02x%02x%02x%02x%02x",
-                 (int)len,
-                 peer_public_key[0], peer_public_key[1],
-                 peer_public_key[2], peer_public_key[3],
-                 peer_public_key[4], peer_public_key[5],
-                 peer_public_key[6], peer_public_key[7]);
-
-        /* Dump first handshake fully for byte-level verification */
-        if (init_dump_count < 1 && len == 148) {
-            init_dump_count++;
-            /* WG handshake init: type(1) reserved(3) sender(4) ephemeral(32)
-             * enc_static(48) enc_timestamp(28) mac1(16) mac2(16) = 148 */
-            ESP_LOGI(TAG, "  type=%02x res=%02x%02x%02x sender=%02x%02x%02x%02x",
-                     data[0], data[1], data[2], data[3],
-                     data[4], data[5], data[6], data[7]);
-            ESP_LOGI(TAG, "  ephemeral=%02x%02x%02x%02x...%02x%02x%02x%02x",
-                     data[8], data[9], data[10], data[11],
-                     data[36], data[37], data[38], data[39]);
-            ESP_LOGI(TAG, "  mac1=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-                     data[116], data[117], data[118], data[119],
-                     data[120], data[121], data[122], data[123],
-                     data[124], data[125], data[126], data[127],
-                     data[128], data[129], data[130], data[131]);
-            ESP_LOGI(TAG, "  mac2=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-                     data[132], data[133], data[134], data[135],
-                     data[136], data[137], data[138], data[139],
-                     data[140], data[141], data[142], data[143],
-                     data[144], data[145], data[146], data[147]);
-        }
+        ESP_LOGI(TAG, "WG INIT len=%d", (int)len);
     }
 
     esp_err_t err = ml_derp_queue_send(ml, peer_public_key, data, len);
@@ -389,15 +360,8 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
         struct wireguard_device *dev = (struct wireguard_device *)netif->state;
         if (dev) {
             bool match = (memcmp(dev->public_key, ml->wg_public_key, 32) == 0);
-            ESP_LOGI(TAG, "WG device pubkey: %02x%02x%02x%02x... %s ml->wg_public_key",
-                     dev->public_key[0], dev->public_key[1],
-                     dev->public_key[2], dev->public_key[3],
+            ESP_LOGI(TAG, "WG device pubkey %s ml->wg_public_key",
                      match ? "MATCHES" : "MISMATCH!");
-            if (!match) {
-                ESP_LOGE(TAG, "  Expected: %02x%02x%02x%02x...",
-                         ml->wg_public_key[0], ml->wg_public_key[1],
-                         ml->wg_public_key[2], ml->wg_public_key[3]);
-            }
         }
     }
 
@@ -485,10 +449,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
                 }
             }
             if (evict_idx >= 0) {
-                char evict_ip[16];
-                microlink_ip_to_str(ml->peers[evict_idx].vpn_ip, evict_ip);
-                ESP_LOGW(TAG, "Evicting LRU peer idx=%d (%s) for the priority peer",
-                         evict_idx, evict_ip);
+                ESP_LOGW(TAG, "Evicting LRU peer idx=%d for the priority peer", evict_idx);
                 if (ml->peers[evict_idx].wg_peer_index >= 0 && ml->wg_netif) {
                     wireguardif_remove_peer((struct netif *)ml->wg_netif,
                                             ml->peers[evict_idx].wg_peer_index);
@@ -535,12 +496,8 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->best_port = 0;
     p->wg_peer_index = -1;
 
-    char ip_str[16];
-    microlink_ip_to_str(update->vpn_ip, ip_str);
-    ESP_LOGI(TAG, "Peer added: (%s) idx=%d endpoints=%d derp=%d key=%02x%02x%02x%02x%02x%02x%02x%02x",
-             ip_str, idx, p->endpoint_count, p->derp_region,
-             p->public_key[0], p->public_key[1], p->public_key[2], p->public_key[3],
-             p->public_key[4], p->public_key[5], p->public_key[6], p->public_key[7]);
+    ESP_LOGI(TAG, "Peer added: idx=%d endpoints=%d derp=%d",
+             idx, p->endpoint_count, p->derp_region);
 
     /* Add to wireguard-lwip */
     if (ml->wg_netif) {
@@ -596,11 +553,8 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
             if (dev && wg_peer_idx < WIREGUARD_MAX_PEERS) {
                 struct wireguard_peer *wp = &dev->peers[wg_peer_idx];
                 bool key_match = (memcmp(wp->public_key, p->public_key, 32) == 0);
-                ESP_LOGI(TAG, "WG peer added: wg_idx=%d internal_key=%02x%02x%02x%02x %s",
-                         wg_peer_idx,
-                         wp->public_key[0], wp->public_key[1],
-                         wp->public_key[2], wp->public_key[3],
-                         key_match ? "KEY_OK" : "KEY_MISMATCH!");
+                ESP_LOGI(TAG, "WG peer added: wg_idx=%d %s",
+                         wg_peer_idx, key_match ? "KEY_OK" : "KEY_MISMATCH!");
             }
 
             /* DON'T initiate handshakes to all peers on add.
@@ -670,9 +624,7 @@ static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
         wireguardif_remove_peer(netif, (u8_t)ml->peers[idx].wg_peer_index);
     }
 
-    char ip_str[16];
-    microlink_ip_to_str(ml->peers[idx].vpn_ip, ip_str);
-    ESP_LOGI(TAG, "Peer removed: idx=%d (%s)", idx, ip_str);
+    ESP_LOGI(TAG, "Peer removed: idx=%d", idx);
 
     ml->peers[idx].active = false;
 
@@ -1032,12 +984,10 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                                 struct wireguard_peer *pp = &dbg->peers[k];
                                 if (!pp->valid) continue;
                                 ESP_LOGW(TAG, "    slot=%d active=%d curr_valid=%d prev_valid=%d "
-                                              "via=%s pub=%02x%02x%02x%02x",
+                                              "via=%s",
                                          k, (int)pp->active, (int)pp->curr_keypair.valid,
                                          (int)pp->prev_keypair.valid,
-                                         ip_addr_isany(&pp->ip) ? "DERP" : "direct",
-                                         pp->public_key[0], pp->public_key[1],
-                                         pp->public_key[2], pp->public_key[3]);
+                                         ip_addr_isany(&pp->ip) ? "DERP" : "direct");
                             }
                         }
                     }
@@ -1094,9 +1044,8 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     /* Verify DISCO magic */
     if (memcmp(pkt->data, DISCO_MAGIC, 6) != 0) return;
 
-    ESP_LOGI(TAG, "DISCO RX: %d bytes via %s, disco_key=%02x%02x%02x%02x",
-             (int)pkt->len, pkt->via_derp ? "DERP" : "direct",
-             pkt->data[6], pkt->data[7], pkt->data[8], pkt->data[9]);
+    ESP_LOGI(TAG, "DISCO RX: %d bytes via %s",
+             (int)pkt->len, pkt->via_derp ? "DERP" : "direct");
 
     /* Extract sender's disco public key */
     const uint8_t *sender_disco_key = pkt->data + 6;
@@ -1171,12 +1120,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                 }
                 if (entry[10] != 0xff || entry[11] != 0xff) is_v4_mapped = false;
 
-                ESP_LOGI(TAG, "  CMM ep[%d]: v4mapped=%d port=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-                         i, is_v4_mapped, port,
-                         entry[0], entry[1], entry[2], entry[3],
-                         entry[4], entry[5], entry[6], entry[7],
-                         entry[8], entry[9], entry[10], entry[11],
-                         entry[12], entry[13], entry[14], entry[15]);
+                ESP_LOGI(TAG, "  CMM ep[%d]: v4mapped=%d", i, is_v4_mapped);
 
                 if (!is_v4_mapped || port == 0) continue;
 
@@ -1218,10 +1162,9 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
  * ========================================================================== */
 
 static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
-    ESP_LOGI(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
+    ESP_LOGI(TAG, "WG RX: %d bytes, via_derp=%d, type=%d",
              (int)pkt->len, pkt->via_derp,
-             pkt->len >= 4 ? pkt->data[0] : -1,
-             pkt->src_pubkey[0], pkt->src_pubkey[1], pkt->src_pubkey[2], pkt->src_pubkey[3]);
+             pkt->len >= 4 ? pkt->data[0] : -1);
     if (!ml->wg_netif) {
         free(pkt->data);
         return;
@@ -1302,11 +1245,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
                 plaintext[pt_len++] = local_port & 0xFF;
                 ep_count++;
 
-                ESP_LOGI(TAG, "CMM endpoint: LAN %lu.%lu.%lu.%lu:%u",
-                         (unsigned long)((local_ip >> 24) & 0xFF),
-                         (unsigned long)((local_ip >> 16) & 0xFF),
-                         (unsigned long)((local_ip >> 8) & 0xFF),
-                         (unsigned long)(local_ip & 0xFF), local_port);
+                ESP_LOGI(TAG, "CMM endpoint: LAN added");
             }
         }
     }
@@ -1327,11 +1266,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
         plaintext[pt_len++] = pub_port & 0xFF;
         ep_count++;
 
-        ESP_LOGI(TAG, "CMM endpoint: STUN %lu.%lu.%lu.%lu:%u",
-                 (unsigned long)((pub_ip >> 24) & 0xFF),
-                 (unsigned long)((pub_ip >> 16) & 0xFF),
-                 (unsigned long)((pub_ip >> 8) & 0xFF),
-                 (unsigned long)(pub_ip & 0xFF), pub_port);
+        ESP_LOGI(TAG, "CMM endpoint: STUN added");
     }
 
     if (ep_count == 0) {
@@ -1441,11 +1376,9 @@ bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
         if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
             struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
             bool key_match = (memcmp(wp->public_key, p->public_key, 32) == 0);
-            ESP_LOGI(TAG, "WG peer UP: peer %d wg_idx=%d via=%s key=%02x%02x%02x%02x %s",
+            ESP_LOGI(TAG, "WG peer UP: peer %d wg_idx=%d via=%s %s",
                      PEER_SLOT(p), p->wg_peer_index,
                      ip_addr_isany(&cur_ip) ? "DERP" : "direct",
-                     wp->public_key[0], wp->public_key[1],
-                     wp->public_key[2], wp->public_key[3],
                      key_match ? "KEY_OK" : "KEY_MISMATCH!");
         }
     }
