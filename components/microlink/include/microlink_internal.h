@@ -206,6 +206,9 @@ typedef struct {
 #define ML_EVT_EXIT_DERP            BIT10
 #define ML_EVT_EXIT_COORD           BIT11
 #define ML_EVT_EXIT_WG_MGR          BIT12
+/* microlink_set_priority_peer_name(NULL): coord recomputes the home region. A bit,
+ * not a queued command, so it cannot be lost to a full command queue. */
+#define ML_EVT_PRIORITY_CLEARED     BIT13
 
 /* ============================================================================
  * Queue Message Types
@@ -246,7 +249,6 @@ typedef enum {
     ML_CMD_RESYNC_NETMAP,       /* read the full netmap again (priority peer name changed) */
     ML_CMD_REBIND,              /* microlink_rebind(): drop network-bound state, then as FORCE_RECONNECT */
     ML_CMD_SHUTDOWN_WAKE,       /* microlink_stop(): end a wait on the command queue */
-    ML_CMD_PRIORITY_CLEARED,    /* the priority name was cleared: recompute the home region */
 } ml_coord_cmd_t;
 
 /* Peer update (from coord to wg_mgr) */
@@ -355,7 +357,13 @@ typedef struct {
     uint64_t next_ms;       /* earliest next attempt */
     bool home_decided;      /* a connect request came while registered */
     bool awaiting_frame;    /* connected, no frame read yet */
+    uint16_t hold_region;   /* a probe of this region failed: no attempt until the home
+                             * region changes or a new probe starts */
 } ml_derp_retry_t;
+
+/* One DERP dial (TCP connect) attempt, tailscale v1.104.0 derp/derphttp
+ * derphttp_client.go: dialNodeTimeout = 1500 * time.Millisecond. */
+#define ML_DERP_DIAL_TIMEOUT_MS     1500
 
 /* ============================================================================
  * DERP home region by measured latency (ml_netcheck.c, owned by coord task)
@@ -408,7 +416,7 @@ typedef struct {
 } ml_dns_item_t;
 
 typedef struct {
-    volatile bool done;     /* tcpip thread: every item has its status */
+    bool done;              /* tcpip thread: every item has its status (ml_dns_job_*_done) */
     bool detached;          /* tcpip thread only: the owner is gone, free on finish */
     bool stepping;          /* tcpip thread only */
     int next;               /* tcpip thread only */
@@ -439,6 +447,9 @@ typedef struct {
     uint32_t peer_ip;                       /* its VPN address */
     uint16_t peer_region;
     ml_dns_job_t *dns_job;                  /* node name lookups in flight */
+    uint16_t preferred;                     /* PreferredDERP: the home, except a probed
+                                             * region before its connection carried a frame */
+    uint16_t announced;                     /* preferred as last sent to control */
 } ml_netcheck_t;
 
 /* ============================================================================
@@ -525,6 +536,9 @@ struct microlink_s {
     volatile uint32_t derp_target_gen;
     volatile uint16_t derp_failed_region;  /* DERP task: home region whose connects keep failing */
     volatile uint16_t derp_ok_region;      /* DERP task: region whose connection carried a frame */
+    volatile uint16_t derp_probe_region;   /* coord: retry of the priority peer's excluded
+                                            * region, one attempt (cleared by the DERP task) */
+    volatile uint16_t derp_probe_failed;   /* DERP task: that one attempt failed */
 
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */
@@ -682,10 +696,20 @@ uint16_t ml_nc_effective_home(const ml_derp_region_t *regions, int count,
 uint32_t ml_derp_backoff_ms(int failures, uint32_t rnd);   /* rnd: uniform 32-bit */
 bool ml_derp_backoff_capped(int failures);
 void ml_derp_retry_on_bits(ml_derp_retry_t *s, bool registered, bool connect_req);
-bool ml_derp_retry_due(const ml_derp_retry_t *s, bool connected, bool registered, uint64_t now_ms);
+bool ml_derp_retry_due(const ml_derp_retry_t *s, bool connected, bool registered, uint64_t now_ms,
+                       uint16_t region, uint16_t probe_region);
 void ml_derp_retry_attempt(ml_derp_retry_t *s, uint16_t region);
 bool ml_derp_retry_frame(ml_derp_retry_t *s);              /* true: the first one */
-uint32_t ml_derp_retry_failed(ml_derp_retry_t *s, uint64_t now_ms, uint32_t rnd);
+uint32_t ml_derp_retry_failed(ml_derp_retry_t *s, uint64_t now_ms, uint32_t rnd, bool probe);
+void ml_dns_item_answer(ml_dns_item_t *it, bool answered, uint32_t ipv4);
+bool ml_is_library_task(const microlink_t *ml, TaskHandle_t task);
+/* job->done crosses cores (tcpip thread to coord): release / acquire. */
+static inline void ml_dns_job_set_done(ml_dns_job_t *job) {
+    __atomic_store_n(&job->done, true, __ATOMIC_RELEASE);
+}
+static inline bool ml_dns_job_is_done(const ml_dns_job_t *job) {
+    return __atomic_load_n(&job->done, __ATOMIC_ACQUIRE);
+}
 /* ml_netcheck.c: one measurement round, driven by the coord task */
 bool ml_netcheck_on_derp_map(microlink_t *ml);
 void ml_netcheck_request_full(microlink_t *ml);
@@ -704,7 +728,10 @@ bool ml_netcheck_on_stun(microlink_t *ml, const uint8_t *data, size_t len, int64
 bool ml_netcheck_end(microlink_t *ml, int64_t now_us);     /* true: home changed */
 void ml_netcheck_abort(microlink_t *ml);                   /* shutdown: no side effects */
 void ml_netcheck_release(microlink_t *ml);                 /* coord exit: free, detach DNS */
-void ml_netcheck_forget_derp_failures(microlink_t *ml);    /* rebind: try every region again */
+void ml_netcheck_forget_derp_failures(microlink_t *ml);    /* rebind, start: every region again */
+void ml_netcheck_poll_derp(microlink_t *ml);               /* coord loop: DERP task reports */
+uint16_t ml_netcheck_preferred(microlink_t *ml);           /* PreferredDERP we announce */
+bool ml_netcheck_take_announce(microlink_t *ml);           /* preferred changed since sent */
 bool ml_netcheck_apply_home(microlink_t *ml);
 bool ml_netcheck_take_home_change(microlink_t *ml);
 

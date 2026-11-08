@@ -37,6 +37,7 @@ typedef struct { int unused; } portMUX_TYPE;
 #define BIT10 (1u << 10)
 #define BIT11 (1u << 11)
 #define BIT12 (1u << 12)
+#define BIT13 (1u << 13)
 
 static inline void vTaskDelay(TickType_t ms) { usleep(ms * 1000u); }
 static inline void vTaskDelete(TaskHandle_t t) { (void)t; }
@@ -50,7 +51,9 @@ static inline EventBits_t xEventGroupGetBits(EventGroupHandle_t e) { (void)e; re
 static inline EventBits_t xEventGroupSetBits(EventGroupHandle_t e, EventBits_t b) {
     (void)e; shim_event_bits_set |= b; return b;
 }
-static inline EventBits_t xEventGroupClearBits(EventGroupHandle_t e, EventBits_t b) { (void)e; return b; }
+static inline EventBits_t xEventGroupClearBits(EventGroupHandle_t e, EventBits_t b) {
+    (void)e; EventBits_t prev = shim_event_bits_get; shim_event_bits_get &= ~b; return prev;
+}
 static inline EventBits_t xEventGroupWaitBits(EventGroupHandle_t e, EventBits_t b, BaseType_t c,
                                               BaseType_t a, TickType_t t) {
     (void)e; (void)b; (void)c; (void)a; (void)t; return 0;

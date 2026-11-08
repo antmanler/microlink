@@ -415,7 +415,10 @@ esp_err_t microlink_start(microlink_t *ml) {
     xEventGroupClearBits(ml->events, ML_EVT_SHUTDOWN_REQUEST | ML_EVT_EXIT_NET_IO |
                          ML_EVT_EXIT_DERP | ML_EVT_EXIT_COORD | ML_EVT_EXIT_WG_MGR |
                          ML_EVT_COORD_REGISTERED | ML_EVT_DERP_CONNECTED |
-                         ML_EVT_DERP_RECONNECT | ML_EVT_DERP_CONNECT_REQ);
+                         ML_EVT_DERP_RECONNECT | ML_EVT_DERP_CONNECT_REQ |
+                         ML_EVT_PRIORITY_CLEARED);
+    /* Region exclusions from the last run (maybe our own outage) do not carry over. */
+    ml_netcheck_forget_derp_failures(ml);
 
     ml->state = ML_STATE_WIFI_WAIT;
 
@@ -627,9 +630,7 @@ static void reap_task(TaskHandle_t *task, StackType_t **stack) {
 esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
     /* From a library task (state_cb runs on coord) the wait below never ends. */
-    TaskHandle_t self = xTaskGetCurrentTaskHandle();
-    if (self == ml->net_io_task || self == ml->derp_tx_task ||
-        self == ml->coord_task || self == ml->wg_mgr_task) {
+    if (ml_is_library_task(ml, xTaskGetCurrentTaskHandle())) {
         ESP_LOGE(TAG, "microlink_stop() called from a MicroLink task: refused");
         return ESP_ERR_INVALID_STATE;
     }
@@ -641,10 +642,13 @@ esp_err_t microlink_stop(microlink_t *ml) {
         ml_rx_packet_t wake = {0};
         xQueueSend(ml->stun_rx_queue, &wake, 0);
     }
-    /* End coord's reconnect backoff wait on its command queue. */
-    if (ml->coord_cmd_queue) {
+    /* End coord's reconnect backoff wait on its command queue. Coord keeps draining
+     * the queue until it exits, so a full queue only delays the wake-up. */
+    if (ml->coord_cmd_queue && ml->coord_task) {
         ml_coord_cmd_t wake_cmd = ML_CMD_SHUTDOWN_WAKE;
-        xQueueSend(ml->coord_cmd_queue, &wake_cmd, 0);
+        while (!(xEventGroupGetBits(ml->events) & ML_EVT_EXIT_COORD) &&
+               xQueueSend(ml->coord_cmd_queue, &wake_cmd, 1) != pdTRUE) {
+        }
     }
 
     /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST). Each sets its
@@ -684,10 +688,12 @@ esp_err_t microlink_stop(microlink_t *ml) {
     return ESP_OK;
 }
 
-void microlink_destroy(microlink_t *ml) {
-    if (!ml) return;
+esp_err_t microlink_destroy(microlink_t *ml) {
+    if (!ml) return ESP_OK;
 
-    microlink_stop(ml);
+    /* A refused stop (from a MicroLink task) leaves the tasks running: free nothing. */
+    esp_err_t err = microlink_stop(ml);
+    if (err != ESP_OK) return err;
 
     /* Deinitialize peer NVS */
     ml_peer_nvs_deinit();
@@ -717,6 +723,7 @@ void microlink_destroy(microlink_t *ml) {
 
     free(ml);
     ESP_LOGI(TAG, "Destroyed");
+    return ESP_OK;
 }
 
 /* ============================================================================

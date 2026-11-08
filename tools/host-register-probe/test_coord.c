@@ -43,6 +43,8 @@ static void on_state(microlink_t *ml, microlink_state_t st, void *user) {
     if (g_cb_count < 8) g_cb_states[g_cb_count++] = st;
 }
 
+extern EventBits_t shim_event_bits_set, shim_event_bits_get;
+
 static microlink_t *new_ml(bool interactive) {
     microlink_t *ml = calloc(1, sizeof(*ml));
     portMUX_INITIALIZE(&ml->id_lock);
@@ -653,7 +655,7 @@ static void test_priority_setter(void) {
 
     /* Clearing never needs a re-read; bad arguments are refused. */
     CHECK(microlink_set_priority_peer_name(ml, NULL) == ESP_OK && ml->priority_name[0] == '\0');
-    CHECK(stub_cmd_sent == 2 && stub_cmd_last == ML_CMD_PRIORITY_CLEARED);
+    CHECK(stub_cmd_sent == 1 && (shim_event_bits_set & ML_EVT_PRIORITY_CLEARED));
     char longname[ML_DNS_NAME_MAX + 3];
     memset(longname, 'a', sizeof(longname) - 1);
     longname[sizeof(longname) - 1] = '\0';
@@ -768,9 +770,7 @@ static void test_rebind_clears_stun(void) {
 
 /* ---- review fixes: home change always reconnects DERP; map edits; eviction --- */
 
-extern EventBits_t shim_event_bits_set;
 
-extern EventBits_t shim_event_bits_get;
 
 static void test_home_change_reconnects_derp(void) {
     microlink_t *ml = new_ml(false);
@@ -913,22 +913,22 @@ static void test_derp_retry(void) {
     /* A request from before registration does not count. */
     ml_derp_retry_on_bits(&s, false, true);
     ml_derp_retry_on_bits(&s, true, false);
-    CHECK(!ml_derp_retry_due(&s, false, true, 0));
+    CHECK(!ml_derp_retry_due(&s, false, true, 0, 0, 0));
     /* Registered alone is not enough: the round may still move the home region. */
     ml_derp_retry_on_bits(&s, true, false);
-    CHECK(!ml_derp_retry_due(&s, false, true, 0));
+    CHECK(!ml_derp_retry_due(&s, false, true, 0, 0, 0));
     ml_derp_retry_on_bits(&s, true, true);
-    CHECK(ml_derp_retry_due(&s, false, true, 0));
-    CHECK(!ml_derp_retry_due(&s, true, true, 0));
+    CHECK(ml_derp_retry_due(&s, false, true, 0, 0, 0));
+    CHECK(!ml_derp_retry_due(&s, true, true, 0, 0, 0));
 
     /* The server accepts and the first read fails, again and again: the wait grows. */
     uint64_t now = 1000;
     uint32_t prev = 0;
     for (int i = 1; i <= 4; i++) {
         ml_derp_retry_attempt(&s, 904);
-        uint32_t w = ml_derp_retry_failed(&s, now, 0x80000000u);
+        uint32_t w = ml_derp_retry_failed(&s, now, 0x80000000u, false);
         CHECK(s.failures == i && w > prev && s.next_ms == now + w);
-        CHECK(!ml_derp_retry_due(&s, false, true, now + w - 1) && ml_derp_retry_due(&s, false, true, now + w));
+        CHECK(!ml_derp_retry_due(&s, false, true, now + w - 1, 0, 0) && ml_derp_retry_due(&s, false, true, now + w, 0, 0));
         prev = w;
         now += w;
     }
@@ -936,7 +936,7 @@ static void test_derp_retry(void) {
     ml_derp_retry_attempt(&s, 904);
     CHECK(ml_derp_retry_frame(&s) && s.failures == 0);
     CHECK(!ml_derp_retry_frame(&s));
-    CHECK(ml_derp_retry_failed(&s, now, 0x80000000u) == ml_derp_backoff_ms(1, 0x80000000u));
+    CHECK(ml_derp_retry_failed(&s, now, 0x80000000u, false) == ml_derp_backoff_ms(1, 0x80000000u));
     /* Another region starts its own count. */
     ml_derp_retry_attempt(&s, 905);
     CHECK(s.failures == 0 && s.region == 905);
@@ -944,9 +944,9 @@ static void test_derp_retry(void) {
     /* Registration lost (rebind): no connect until coord asks again. */
     ml_derp_retry_on_bits(&s, false, false);
     ml_derp_retry_on_bits(&s, true, false);
-    CHECK(!ml_derp_retry_due(&s, false, true, now + 100000));
+    CHECK(!ml_derp_retry_due(&s, false, true, now + 100000, 0, 0));
     ml_derp_retry_on_bits(&s, true, true);
-    CHECK(ml_derp_retry_due(&s, false, true, now));
+    CHECK(ml_derp_retry_due(&s, false, true, now, 0, 0));
 }
 
 static void test_effective_home_usable(void) {
@@ -1084,6 +1084,106 @@ static void test_priority_region_retried(void) {
     free(ml);
 }
 
+/* Round 5: a full-round retry of the priority region is one probe attempt, announced
+ * only after a frame; offline rounds record no exclusion; DNS answers. */
+static void test_priority_probe(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    microlink_set_priority_peer_name(ml, "p4-dock.tail1234.ts.net");
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":[{\"Name\":\"p4-dock.tail1234.ts.net.\","
+                     "\"Key\":\"" PRIO_KEY "\",\"HomeDERP\":902}]}") == 0);
+    int64_t t = 9000000000LL;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    ml_netcheck_end(ml, t + 1000);
+    CHECK(ml_netcheck_preferred(ml) == 902 && !ml_netcheck_take_announce(ml));
+    ml->derp_failed_region = 902;                       /* 902 unreachable */
+    t += 30000000;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 901);
+    CHECK(ml_netcheck_take_announce(ml) && ml->netcheck.preferred == 901);
+
+    /* Full round: 902 is probed. Home moves, PreferredDERP does not. */
+    t += ML_NC_FULL_INTERVAL_MS * 1000LL;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    CHECK(ml->derp_probe_region == 902);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+    CHECK(ml->netcheck.preferred == 901 && !ml_netcheck_take_announce(ml));
+
+    /* The DERP task's one attempt fails: no second attempt while 902 is home... */
+    ml_derp_retry_t s = {0};
+    ml_derp_retry_on_bits(&s, true, true);
+    ml_derp_retry_attempt(&s, 902);
+    ml_derp_retry_failed(&s, 0, 0x80000000u, true);
+    CHECK(!ml_derp_retry_due(&s, false, true, 100000, 902, 0));
+    CHECK(ml_derp_retry_due(&s, false, true, 100000, 901, 0));
+    CHECK(ml_derp_retry_due(&s, false, true, 100000, 902, 902));    /* a new probe */
+    /* ...and coord goes back at once, without announcing anything. */
+    ml->derp_probe_region = 0;
+    ml->derp_probe_failed = 902;
+    ml_netcheck_poll_derp(ml);
+    CHECK(ml->derp_home_region == 901 && ml_netcheck_take_home_change(ml));
+    CHECK(ml->derp_regions[region_idx(ml, 902)].derp_failed && !ml_netcheck_take_announce(ml));
+
+    /* Next full round: probed again; this time a frame arrives and 902 is announced. */
+    t += ML_NC_FULL_INTERVAL_MS * 1000LL;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+    CHECK(!ml_netcheck_take_announce(ml));
+    ml->derp_probe_region = 0;
+    ml->derp_ok_region = 902;
+    ml_netcheck_poll_derp(ml);
+    CHECK(ml_netcheck_take_announce(ml) && ml->netcheck.preferred == 902);
+    CHECK(!ml->derp_regions[region_idx(ml, 902)].derp_failed);
+
+    /* Offline (no STUN reply in the round): a DERP failure is not the region's fault. */
+    ml->derp_failed_region = 901;
+    t += 30000000;
+    nc_round(ml, t, 0, 0, 0, 0);
+    ml_netcheck_end(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL);
+    CHECK(!ml->derp_regions[region_idx(ml, 901)].derp_failed && ml->derp_failed_region == 0);
+
+    /* Start: nothing from the last run carries over. */
+    ml->derp_regions[region_idx(ml, 901)].derp_failed = true;
+    ml->derp_failed_region = ml->derp_ok_region = ml->derp_probe_region = ml->derp_probe_failed = 901;
+    ml_netcheck_forget_derp_failures(ml);
+    CHECK(!ml->derp_regions[region_idx(ml, 901)].derp_failed && !ml->derp_failed_region &&
+          !ml->derp_ok_region && !ml->derp_probe_region && !ml->derp_probe_failed);
+    free(ml->netcheck.probes);
+    free(ml);
+}
+
+static void test_dns_answers_and_library_task(void) {
+    ml_dns_item_t it = {0};
+    ml_dns_item_answer(&it, false, 0);                   /* timeout or no such name */
+    CHECK(it.status == ML_DNS_RETRY);
+    ml_dns_item_answer(&it, true, 0xC0000201u);
+    CHECK(it.status == ML_DNS_OK && it.ipv4 == 0xC0000201u);
+
+    /* A finished job with nothing resolved does not ask for a round. */
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    stub_dns_job = NULL;
+    CHECK(fetch_with(ml, "{\"DERPMap\":{\"Regions\":{"
+        "\"901\":{\"RegionID\":901,\"Nodes\":[{\"HostName\":\"d1.example.invalid\"}]}}},"
+        "\"Peers\":[]}") == 0);
+    CHECK(!ml_netcheck_begin(ml, 7000000000LL) && stub_dns_job);
+    ml->netcheck.next_full = false;
+    ml->netcheck.last_round_ms = 7000000;
+    stub_dns_job->items[0].status = ML_DNS_RETRY;
+    ml_dns_job_set_done(stub_dns_job);
+    CHECK(!ml_netcheck_due(ml, 7000001));
+    stub_dns_job->items[0].status = ML_DNS_OK;
+    CHECK(ml_netcheck_due(ml, 7000001));
+    ml_netcheck_release(ml);
+    free(ml);
+
+    /* microlink_stop/destroy refuse to run on a MicroLink task. */
+    microlink_t m = {0};
+    int a, b;
+    m.coord_task = &a;
+    CHECK(ml_is_library_task(&m, &a) && !ml_is_library_task(&m, &b) && !ml_is_library_task(&m, NULL));
+}
+
 static void test_priority_cleared(void) {
     microlink_t *ml = new_ml(false);
     ml->t_stun_interval_ms = 23000;
@@ -1095,13 +1195,18 @@ static void test_priority_cleared(void) {
     ml->netcheck.latency_home = 901;
     /* Still named by CONFIG_ML_PRIORITY_PEER_IP: kept. */
     ml->config.priority_peer_ip = 0x64400003u;
-    coord_state_t st = COORD_LONG_POLL;
-    coord_handle_command(ml, &st, ML_CMD_PRIORITY_CLEARED);
+    shim_event_bits_get = ML_EVT_PRIORITY_CLEARED;
+    coord_priority_cleared(ml);
     CHECK(ml->derp_home_region == 902 && !ml_netcheck_take_home_change(ml));
+    CHECK(!(shim_event_bits_get & ML_EVT_PRIORITY_CLEARED));        /* taken once */
     /* Not named any more: the latency choice at once, no netmap re-read. */
     ml->config.priority_peer_ip = 0;
-    coord_handle_command(ml, &st, ML_CMD_PRIORITY_CLEARED);
-    CHECK(ml->derp_home_region == 901 && ml_netcheck_take_home_change(ml) && st == COORD_LONG_POLL);
+    coord_priority_cleared(ml);                                     /* no bit: nothing */
+    CHECK(ml->derp_home_region == 902);
+    shim_event_bits_get = ML_EVT_PRIORITY_CLEARED;
+    coord_priority_cleared(ml);
+    CHECK(ml->derp_home_region == 901 && ml_netcheck_take_home_change(ml));
+    shim_event_bits_get = 0;
     free(ml);
 }
 
@@ -1228,6 +1333,8 @@ int main(void) {
     test_effective_home_usable();
     test_priority_cleared();
     test_priority_region_retried();
+    test_priority_probe();
+    test_dns_answers_and_library_task();
     test_stop_and_drain();
     test_rtt_from_receive_time();
     test_map_edits();

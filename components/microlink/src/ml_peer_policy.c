@@ -54,11 +54,15 @@ esp_err_t microlink_set_priority_peer_name(microlink_t *ml, const char *fqdn) {
         (st == ML_STATE_CONNECTED || st == ML_STATE_NEEDS_MACHINE_AUTH)) {
         ml_coord_cmd_t cmd = ML_CMD_RESYNC_NETMAP;
         xQueueSend(ml->coord_cmd_queue, &cmd, 0);
-    } else if (changed && len == 0 && ml->coord_cmd_queue) {
-        ml_coord_cmd_t cmd = ML_CMD_PRIORITY_CLEARED;
-        xQueueSend(ml->coord_cmd_queue, &cmd, 0);
+    } else if (changed && len == 0) {
+        xEventGroupSetBits(ml->events, ML_EVT_PRIORITY_CLEARED);
     }
     return ESP_OK;
+}
+
+bool ml_is_library_task(const microlink_t *ml, TaskHandle_t task) {
+    return task != NULL && (task == ml->net_io_task || task == ml->derp_tx_task ||
+                            task == ml->coord_task || task == ml->wg_mgr_task);
 }
 
 void ml_copy_priority_name(microlink_t *ml, char *buf, size_t len) {

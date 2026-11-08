@@ -230,7 +230,9 @@ void ml_derp_retry_on_bits(ml_derp_retry_t *s, bool registered, bool connect_req
     }
 }
 
-bool ml_derp_retry_due(const ml_derp_retry_t *s, bool connected, bool registered, uint64_t now_ms) {
+bool ml_derp_retry_due(const ml_derp_retry_t *s, bool connected, bool registered, uint64_t now_ms,
+                       uint16_t region, uint16_t probe_region) {
+    if (region != 0 && region == s->hold_region && probe_region != region) return false;
     return !connected && registered && s->home_decided && now_ms >= s->next_ms;
 }
 
@@ -239,6 +241,7 @@ void ml_derp_retry_attempt(ml_derp_retry_t *s, uint16_t region) {
         s->region = region;
         s->failures = 0;
     }
+    s->hold_region = 0;
     s->awaiting_frame = true;       /* until a frame is read, it is not a success */
 }
 
@@ -251,7 +254,10 @@ bool ml_derp_retry_frame(ml_derp_retry_t *s) {
 }
 
 /* A failed connect, or a connection lost before its first frame. Returns the wait. */
-uint32_t ml_derp_retry_failed(ml_derp_retry_t *s, uint64_t now_ms, uint32_t rnd) {
+/* probe: the one attempt of a full-round retry (ml_netcheck_begin); no second one
+ * until coord moves the home region or probes again. */
+uint32_t ml_derp_retry_failed(ml_derp_retry_t *s, uint64_t now_ms, uint32_t rnd, bool probe) {
+    if (probe) s->hold_region = s->region;
     s->awaiting_frame = false;
     s->failures++;
     uint32_t wait = ml_derp_backoff_ms(s->failures, rnd);
@@ -279,7 +285,55 @@ bool ml_netcheck_apply_home(microlink_t *ml) {
              home == nc->peer_region ? "priority peer" : "latency");
     ml->derp_home_region = home;
     nc->home_changed = true;
+    /* A probed region is announced only once a connection to it carried a frame. */
+    if (home != ml->derp_probe_region) nc->preferred = home;
     return true;
+}
+
+uint16_t ml_netcheck_preferred(microlink_t *ml) {
+    ml->netcheck.announced = ml->netcheck.preferred;   /* the caller sends it */
+    return ml->netcheck.preferred;
+}
+
+bool ml_netcheck_take_announce(microlink_t *ml) {
+    ml_netcheck_t *nc = &ml->netcheck;
+    if (nc->preferred == nc->announced) return false;
+    nc->announced = nc->preferred;
+    return true;
+}
+
+static void mark_region(microlink_t *ml, uint16_t id, bool failed) {
+    for (int i = 0; id && i < ml->derp_region_count; i++) {
+        if (ml->derp_regions[i].region_id == id) ml->derp_regions[i].derp_failed = failed;
+    }
+}
+
+/* DERP task reports between rounds: a failed probe goes back at once (the latency
+ * choice is taken again from the last report); a frame on a region lifts its
+ * exclusion and makes a probed home the announced one. */
+void ml_netcheck_poll_derp(microlink_t *ml) {
+    ml_netcheck_t *nc = &ml->netcheck;
+    uint16_t pf = ml->derp_probe_failed;
+    if (pf) {
+        ml->derp_probe_failed = 0;
+        mark_region(ml, pf, true);
+        if (nc->latency_home == pf) {
+            uint32_t lat[ML_MAX_DERP_REGIONS] = {0};
+            for (int k = 0; k < nc->last_count; k++) {
+                int i = region_index(ml->derp_regions, ml->derp_region_count, nc->last[k].region_id);
+                if (i >= 0) lat[i] = nc->last[k].latency_us;
+            }
+            nc->latency_home = ml_nc_pick_home(ml->derp_regions, ml->derp_region_count, lat,
+                                               nc->latency_home, false);
+        }
+        ml_netcheck_apply_home(ml);
+    }
+    uint16_t ok = ml->derp_ok_region;
+    if (ok) {
+        ml->derp_ok_region = 0;
+        mark_region(ml, ok, false);
+        if (ok == ml->derp_home_region) nc->preferred = ok;
+    }
 }
 
 bool ml_netcheck_take_home_change(microlink_t *ml) {
@@ -305,7 +359,12 @@ bool ml_netcheck_due(const microlink_t *ml, uint64_t now_ms) {
     const ml_netcheck_t *nc = &ml->netcheck;
     if (ml->derp_region_count == 0) return false;
     if (nc->next_full || !nc->ran) return true;
-    if (nc->dns_job && nc->dns_job->done) return true;     /* new addresses to measure */
+    if (nc->dns_job && ml_dns_job_is_done(nc->dns_job)) {
+        /* New addresses to measure; nothing resolved waits for the next round. */
+        for (int k = 0; k < nc->dns_job->count; k++) {
+            if (nc->dns_job->items[k].status == ML_DNS_OK) return true;
+        }
+    }
     return now_ms - nc->last_round_ms >= ml->t_stun_interval_ms;
 }
 
@@ -331,7 +390,7 @@ static bool resolve_literal(ml_derp_node_t *n) {
  * a local error is retried with the next round. */
 static void dns_harvest(microlink_t *ml) {
     ml_dns_job_t *job = ml->netcheck.dns_job;
-    if (!job || !job->done) return;
+    if (!job || !ml_dns_job_is_done(job)) return;
     for (int k = 0; k < job->count; k++) {
         const ml_dns_item_t *it = &job->items[k];
         for (int i = 0; i < ml->derp_region_count; i++) {
@@ -397,10 +456,17 @@ bool ml_netcheck_begin(microlink_t *ml, int64_t now_us) {
          * excluded nothing we send reaches that peer. Other regions keep their
          * exclusion until a connection to them carries a frame. */
         uint16_t pr = nc->peer_key_valid ? nc->peer_region : 0;
-        for (int i = 0; pr && i < ml->derp_region_count; i++) {
-            if (ml->derp_regions[i].region_id == pr) ml->derp_regions[i].derp_failed = false;
+        int pi = region_index(ml->derp_regions, ml->derp_region_count, pr);
+        if (ml->derp_probe_region && ml->derp_probe_region != ml->derp_home_region) {
+            ml->derp_probe_region = 0;              /* stale: never attempted */
         }
-        if (pr && ml->derp_failed_region == pr) ml->derp_failed_region = 0;
+        if (pi >= 0 && ml->derp_regions[pi].derp_failed) {
+            /* One attempt (a probe): if it fails the DERP task reports at once and
+             * ml_netcheck_poll_derp() goes back; nothing is announced before a frame. */
+            ml->derp_regions[pi].derp_failed = false;
+            if (ml->derp_failed_region == pr) ml->derp_failed_region = 0;
+            ml->derp_probe_region = pr;
+        }
     }
 
     dns_harvest(ml);
@@ -491,6 +557,20 @@ void ml_netcheck_release(microlink_t *ml) {
 void ml_netcheck_forget_derp_failures(microlink_t *ml) {
     for (int i = 0; i < ml->derp_region_count; i++) ml->derp_regions[i].derp_failed = false;
     ml->derp_failed_region = 0;
+    ml->derp_ok_region = 0;
+    ml->derp_probe_region = 0;
+    ml->derp_probe_failed = 0;
+}
+
+/* A lookup answer: an address, or none. lwIP reports a timeout and a name error the
+ * same way (no address), so neither marks the name failed: retried next round. */
+void ml_dns_item_answer(ml_dns_item_t *it, bool answered, uint32_t ipv4) {
+    if (answered) {
+        it->ipv4 = ipv4;
+        it->status = ML_DNS_OK;
+    } else {
+        it->status = ML_DNS_RETRY;
+    }
 }
 
 bool ml_netcheck_end(microlink_t *ml, int64_t now_us) {
@@ -512,14 +592,12 @@ bool ml_netcheck_end(microlink_t *ml, int64_t now_us) {
      * to it carries a frame, or a rebind. tailscaled has no such rule (it keeps
      * retrying its home); without it a region with good STUN but no DERP reach is
      * chosen again every round. */
+    /* A round with no STUN reply at all means we are offline, not the region: no
+     * exclusion is recorded from it. */
     uint16_t failed = ml->derp_failed_region;
-    uint16_t ok = ml->derp_ok_region;
-    for (int i = 0; i < ml->derp_region_count; i++) {
-        ml_derp_region_t *r = &ml->derp_regions[i];
-        if (failed && r->region_id == failed) r->derp_failed = true;
-        if (ok && r->region_id == ok) r->derp_failed = false;
-    }
-    if (ok && ml->derp_ok_region == ok) ml->derp_ok_region = 0;
+    if (nc->last_count > 0) mark_region(ml, failed, true);
+    else if (failed && ml->derp_failed_region == failed) ml->derp_failed_region = 0;
+    ml_netcheck_poll_derp(ml);
 
     /* The old choice still counts as reachable when its DERP connection carried a
      * frame recently (PreferredDERPFrameTime). */

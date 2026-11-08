@@ -481,8 +481,15 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
  * region whose wait reached the maximum is reported to netcheck, which leaves it out
  * of every home choice until a connection to it carries a frame. */
 static void derp_attempt_failed(microlink_t *ml, ml_derp_retry_t *retry) {
-    uint32_t wait_ms = ml_derp_retry_failed(retry, ml_get_time_ms(), esp_random());
-    if (ml_derp_backoff_capped(retry->failures)) {
+    /* A full-round retry of the priority peer's region gets one attempt: coord moves
+     * back at once (ml_netcheck_poll_derp). */
+    bool probe = ml->derp_probe_region != 0 && ml->derp_probe_region == retry->region;
+    uint32_t wait_ms = ml_derp_retry_failed(retry, ml_get_time_ms(), esp_random(), probe);
+    if (probe) {
+        ml->derp_probe_region = 0;
+        if (ml->derp_ok_region == retry->region) ml->derp_ok_region = 0;
+        ml->derp_probe_failed = retry->region;
+    } else if (ml_derp_backoff_capped(retry->failures)) {
         if (ml->derp_ok_region == retry->region) ml->derp_ok_region = 0;
         ml->derp_failed_region = retry->region;
     }
@@ -557,7 +564,8 @@ void ml_derp_tx_task(void *arg) {
 
             /* Connect while registered, for as long as it takes. */
             if (ml_derp_retry_due(&retry, ml->derp.connected,
-                                  (bits & ML_EVT_COORD_REGISTERED) != 0, ml_get_time_ms())) {
+                                  (bits & ML_EVT_COORD_REGISTERED) != 0, ml_get_time_ms(),
+                                  ml->derp_home_region, ml->derp_probe_region)) {
                 uint16_t region = ml->derp_home_region;
                 ml_derp_retry_attempt(&retry, region);
                 if (ml_derp_connect(ml, region) == ESP_OK) {
@@ -623,6 +631,7 @@ void ml_derp_tx_task(void *arg) {
                     if (ml_derp_retry_frame(&retry)) {
                         /* The region carries traffic: netcheck may choose it again. */
                         if (ml->derp_failed_region == retry.region) ml->derp_failed_region = 0;
+                        if (ml->derp_probe_region == retry.region) ml->derp_probe_region = 0;
                         ml->derp_ok_region = retry.region;
                     }
                 } else if (ret == 0) {
@@ -648,6 +657,40 @@ void ml_derp_tx_task(void *arg) {
 /* ============================================================================
  * DERP Connection Management (called from coord task)
  * ========================================================================== */
+
+/* TCP connect bounded by ML_DERP_DIAL_TIMEOUT_MS: a blocking lwIP connect ignores
+ * SO_SNDTIMEO and waits out every SYN retry (about 20 s) when SYNs are dropped. The
+ * AT-command cellular bridge has its own connect timeout and keeps ml_connect. */
+static int derp_dial(int sock, const struct sockaddr *addr, socklen_t len) {
+    if (ml_at_socket_is_ready()) return ml_connect(sock, addr, len);
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return connect(sock, addr, len);
+    }
+    int r = connect(sock, addr, len);
+    if (r < 0 && errno == EINPROGRESS) {
+        fd_set wr;
+        FD_ZERO(&wr);
+        FD_SET(sock, &wr);
+        struct timeval tv = {
+            .tv_sec = ML_DERP_DIAL_TIMEOUT_MS / 1000,
+            .tv_usec = (ML_DERP_DIAL_TIMEOUT_MS % 1000) * 1000,
+        };
+        r = select(sock + 1, NULL, &wr, NULL, &tv);
+        if (r == 1) {
+            int err = 0;
+            socklen_t elen = sizeof(err);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &elen);
+            r = err ? -1 : 0;
+            if (err) errno = err;
+        } else {
+            r = -1;
+            errno = ETIMEDOUT;
+        }
+    }
+    fcntl(sock, F_SETFL, flags);
+    return r;
+}
 
 static bool derp_stopping(microlink_t *ml) {
     return (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) != 0;
@@ -725,7 +768,7 @@ esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region) {
     ml_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     ml_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+    if (derp_dial(sock, res->ai_addr, res->ai_addrlen) < 0) {
         ESP_LOGE(TAG, "TCP connect failed: %d", errno);
         ml_close_sock(sock);
         ml_freeaddrinfo(res);

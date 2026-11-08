@@ -390,12 +390,8 @@ static void dns_job_found(const char *name, const ip_addr_t *ip, void *arg) {
     (void)name;
     ml_dns_job_t *job = (ml_dns_job_t *)arg;
     ml_dns_item_t *it = &job->items[job->next];
-    if (ip && IP_IS_V4(ip)) {
-        it->ipv4 = ntohl(ip4_addr_get_u32(ip_2_ip4(ip)));
-        it->status = ML_DNS_OK;
-    } else {
-        it->status = ML_DNS_FAILED;     /* no answer for the name */
-    }
+    bool v4 = ip && IP_IS_V4(ip);
+    ml_dns_item_answer(it, v4, v4 ? ntohl(ip4_addr_get_u32(ip_2_ip4(ip))) : 0);
     job->next++;
     if (!job->stepping) dns_job_step(job);
 }
@@ -416,8 +412,7 @@ static void dns_job_step(ml_dns_job_t *job) {
             continue;
         }
         if (e == ERR_OK && IP_IS_V4(&ip)) {
-            it->ipv4 = ntohl(ip4_addr_get_u32(ip_2_ip4(&ip)));
-            it->status = ML_DNS_OK;
+            ml_dns_item_answer(it, true, ntohl(ip4_addr_get_u32(ip_2_ip4(&ip))));
         } else {
             it->status = ML_DNS_RETRY;      /* ERR_MEM (table full), no server: local */
         }
@@ -425,7 +420,7 @@ static void dns_job_step(ml_dns_job_t *job) {
     }
     job->stepping = false;
     if (job->detached) free(job);
-    else job->done = true;
+    else ml_dns_job_set_done(job);
 }
 
 static void dns_job_begin(void *arg) {
@@ -440,16 +435,13 @@ esp_err_t ml_dns_job_start(ml_dns_job_t *job) {
             ml_dns_item_t *it = &job->items[i];
             struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
             struct addrinfo *res = NULL;
-            it->status = ML_DNS_FAILED;
-            if (ml_getaddrinfo(it->host, NULL, &hints, &res) == 0 && res) {
-                if (res->ai_family == AF_INET) {
-                    it->ipv4 = ntohl(((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr);
-                    it->status = ML_DNS_OK;
-                }
-            }
+            bool v4 = ml_getaddrinfo(it->host, NULL, &hints, &res) == 0 && res &&
+                      res->ai_family == AF_INET;
+            ml_dns_item_answer(it, v4,
+                v4 ? ntohl(((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr) : 0);
             if (res) ml_freeaddrinfo(res);
         }
-        job->done = true;
+        ml_dns_job_set_done(job);
         return ESP_OK;
     }
     return tcpip_callback(dns_job_begin, job) == ERR_OK ? ESP_OK : ESP_FAIL;
@@ -464,14 +456,14 @@ struct dns_detach_call {
  * still due on this thread, and it frees the job. */
 static err_t dns_detach_fn(struct tcpip_api_call_data *call) {
     ml_dns_job_t *job = ((struct dns_detach_call *)call)->job;
-    if (job->done) free(job);
+    if (ml_dns_job_is_done(job)) free(job);
     else job->detached = true;
     return ERR_OK;
 }
 
 void ml_dns_job_detach(ml_dns_job_t *job) {
     if (!job) return;
-    if (job->done) {                        /* nothing is due on the tcpip thread */
+    if (ml_dns_job_is_done(job)) {          /* nothing is due on the tcpip thread */
         free(job);
         return;
     }
