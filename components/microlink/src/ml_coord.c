@@ -869,7 +869,7 @@ static int register_send(microlink_t *ml, ml_noise_state_t *noise, const reg_par
         .auth_key = auth_key,
         .followup = p->followup,
         .hostname = ml_device_name(ml),
-        .preferred_derp = ml_netcheck_preferred(ml),   /* 0 until a DERP map is known */
+        .preferred_derp = ml->derp_home_region,     /* 0 until a DERP map is known */
         .challenge_response = chalresp,
     };
     char *json_str = ml_register_build_request(&req);
@@ -1501,7 +1501,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
      * to populate Node.HomeDERP for other peers. */
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml_netcheck_preferred(ml));
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_home_region);
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -1877,7 +1877,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
      * to populate Node.HomeDERP for other peers. */
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml_netcheck_preferred(ml));
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_home_region);
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -1978,7 +1978,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise, boo
 
         cJSON *netinfo = cJSON_CreateObject();
         if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml_netcheck_preferred(ml));
+            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_home_region);
             if (ml->stun_nat_checked) {
                 cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
             }
@@ -2403,8 +2403,7 @@ static void coord_home_changed(microlink_t *ml, ml_noise_state_t *noise, bool lo
     if (xEventGroupGetBits(ml->events) & ML_EVT_COORD_REGISTERED) {
         xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
     }
-    /* Only a changed PreferredDERP is sent; a probed region waits for its first frame. */
-    if (long_poll_open && ml_netcheck_take_announce(ml)) do_send_endpoint_update(ml, noise, true);
+    if (long_poll_open) do_send_endpoint_update(ml, noise, true);
 }
 
 /* One netcheck round (DERP region latency). Blocks until every planned region replied
@@ -3071,12 +3070,9 @@ void ml_coord_task(void *arg) {
                     break;
                 }
 
-                /* The priority peer moved or was cleared, the DERP map changed, or the
-                 * DERP task reported on a region. */
+                /* The priority peer moved or was cleared, or the DERP map changed. */
                 coord_priority_cleared(ml);
-                ml_netcheck_poll_derp(ml);
                 if (ml_netcheck_take_home_change(ml)) coord_home_changed(ml, &noise, true);
-                if (ml_netcheck_take_announce(ml)) do_send_endpoint_update(ml, &noise, true);
 
                 vTaskDelay(pdMS_TO_TICKS(50));
             }

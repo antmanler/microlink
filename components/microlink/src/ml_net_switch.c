@@ -267,6 +267,20 @@ static void cellular_stop(void)
  * MicroLink VPN Management
  * ========================================================================== */
 
+
+/* Destroy the instance; on refusal (called from a MicroLink task) it keeps running
+ * and the handle stays, so nothing is leaked or used after free. */
+static esp_err_t vpn_release(void)
+{
+    esp_err_t err = microlink_destroy(s_ctx.ml);
+    if (err == ESP_OK) {
+        s_ctx.ml = NULL;
+    } else {
+        ESP_LOGE(TAG, "microlink_destroy refused: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
 static esp_err_t vpn_start(void)
 {
     const char *name = s_ctx.device_name[0] ? s_ctx.device_name : NULL;
@@ -297,8 +311,7 @@ static esp_err_t vpn_start(void)
     esp_err_t err = microlink_start(s_ctx.ml);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "microlink_start failed: %s", esp_err_to_name(err));
-        microlink_destroy(s_ctx.ml);
-        s_ctx.ml = NULL;
+        vpn_release();
         return err;
     }
 
@@ -321,19 +334,13 @@ static esp_err_t vpn_start(void)
     }
 
     ESP_LOGW(TAG, "VPN connection timeout (%ds)", timeout_secs);
-    microlink_stop(s_ctx.ml);
-    microlink_destroy(s_ctx.ml);
-    s_ctx.ml = NULL;
+    vpn_release();
     return ESP_ERR_TIMEOUT;
 }
 
 static void vpn_stop(void)
 {
-    if (s_ctx.ml) {
-        microlink_stop(s_ctx.ml);
-        microlink_destroy(s_ctx.ml);
-        s_ctx.ml = NULL;
-    }
+    if (s_ctx.ml) vpn_release();
 }
 
 /* ============================================================================

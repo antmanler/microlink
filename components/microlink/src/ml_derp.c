@@ -477,24 +477,26 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
  * Unified DERP I/O Task
  * ========================================================================== */
 
-/* A connect failed, or the connection broke before its first frame: back off. A
- * region whose wait reached the maximum is reported to netcheck, which leaves it out
- * of every home choice until a connection to it carries a frame. */
+/* A connect failed, or the connection broke before its first frame: back off and
+ * retry the home region, whatever it is, for as long as it takes. A region whose
+ * wait reached the maximum is reported to netcheck, which leaves it out of the
+ * latency choice (never the priority peer's region) until it carries a frame. */
 static void derp_attempt_failed(microlink_t *ml, ml_derp_retry_t *retry) {
-    /* A full-round retry of the priority peer's region gets one attempt: coord moves
-     * back at once (ml_netcheck_poll_derp). */
-    bool probe = ml->derp_probe_region != 0 && ml->derp_probe_region == retry->region;
-    uint32_t wait_ms = ml_derp_retry_failed(retry, ml_get_time_ms(), esp_random(), probe);
-    if (probe) {
-        ml->derp_probe_region = 0;
-        if (ml->derp_ok_region == retry->region) ml->derp_ok_region = 0;
-        ml->derp_probe_failed = retry->region;
-    } else if (ml_derp_backoff_capped(retry->failures)) {
+    uint32_t wait_ms = ml_derp_retry_failed(retry, ml_get_time_ms(), esp_random());
+    if (ml_derp_backoff_capped(retry->failures)) {
         if (ml->derp_ok_region == retry->region) ml->derp_ok_region = 0;
         ml->derp_failed_region = retry->region;
     }
     ESP_LOGW(TAG, "DERP region %u failed (%d in a row), next attempt in %lu ms",
              retry->region, retry->failures, (unsigned long)wait_ms);
+}
+
+/* A frame was read on the connection (ServerInfo during the handshake counts). */
+static void derp_frame_read(microlink_t *ml, ml_derp_retry_t *retry) {
+    if (!ml_derp_retry_frame(retry)) return;
+    /* The region carries traffic: netcheck may choose it again. */
+    if (ml->derp_failed_region == retry->region) ml->derp_failed_region = 0;
+    ml->derp_ok_region = retry->region;
 }
 
 void ml_derp_tx_task(void *arg) {
@@ -564,13 +566,13 @@ void ml_derp_tx_task(void *arg) {
 
             /* Connect while registered, for as long as it takes. */
             if (ml_derp_retry_due(&retry, ml->derp.connected,
-                                  (bits & ML_EVT_COORD_REGISTERED) != 0, ml_get_time_ms(),
-                                  ml->derp_home_region, ml->derp_probe_region)) {
+                                  (bits & ML_EVT_COORD_REGISTERED) != 0, ml_get_time_ms())) {
                 uint16_t region = ml->derp_home_region;
                 ml_derp_retry_attempt(&retry, region);
                 if (ml_derp_connect(ml, region) == ESP_OK) {
                     connected_since_ms = ml_get_time_ms();
                     verbose_phase = true;
+                    if (ml->derp.server_info) derp_frame_read(ml, &retry);
                 } else {
                     derp_attempt_failed(ml, &retry);
                 }
@@ -628,12 +630,7 @@ void ml_derp_tx_task(void *arg) {
                 if (ret > 0) {
                     frames_rx++;
                     ml->derp.last_recv_ms = ml_get_time_ms();
-                    if (ml_derp_retry_frame(&retry)) {
-                        /* The region carries traffic: netcheck may choose it again. */
-                        if (ml->derp_failed_region == retry.region) ml->derp_failed_region = 0;
-                        if (ml->derp_probe_region == retry.region) ml->derp_probe_region = 0;
-                        ml->derp_ok_region = retry.region;
-                    }
+                    derp_frame_read(ml, &retry);
                 } else if (ret == 0) {
                     break;  /* No more data / timeout */
                 } else {
@@ -662,7 +659,7 @@ void ml_derp_tx_task(void *arg) {
  * SO_SNDTIMEO and waits out every SYN retry (about 20 s) when SYNs are dropped. The
  * AT-command cellular bridge has its own connect timeout and keeps ml_connect. */
 static int derp_dial(int sock, const struct sockaddr *addr, socklen_t len) {
-    if (ml_at_socket_is_ready()) return ml_connect(sock, addr, len);
+    if (ml_at_socket_is_at_fd(sock)) return ml_connect(sock, addr, len);
     int flags = fcntl(sock, F_GETFL, 0);
     if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
         return connect(sock, addr, len);
@@ -707,11 +704,65 @@ static esp_err_t derp_connect_fail(microlink_t *ml, int sock) {
     return ESP_FAIL;
 }
 
+/* One TCP connection to one address, bounded by derp_dial(). */
+static int derp_dial_addr(const struct sockaddr *addr, socklen_t len, int family) {
+    int sock = ml_socket(family, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    ml_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    ml_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (derp_dial(sock, addr, len) < 0) {
+        ESP_LOGW(TAG, "TCP connect failed: %d", errno);
+        ml_close_sock(sock);
+        return -1;
+    }
+    return sock;
+}
+
+/* One node, as derphttp dialNode: its IPv4 literal when the map gives one, else
+ * its host name. The name lookup is the resolver's (it cannot be cancelled), so
+ * unlike tailscaled it is not inside the dial timeout; every address it returns
+ * is tried in turn. */
+static int derp_dial_node(microlink_t *ml, const char *host, const char *ipv4, int port) {
+    unsigned a, b, c, d;
+    char extra;
+    if (ipv4[0] && sscanf(ipv4, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) == 4 &&
+        a <= 255 && b <= 255 && c <= 255 && d <= 255) {
+        struct sockaddr_in sa = {
+            .sin_family = AF_INET,
+            .sin_port = htons((uint16_t)port),
+            .sin_addr.s_addr = htonl((a << 24) | (b << 16) | (c << 8) | d),
+        };
+        return derp_dial_addr((const struct sockaddr *)&sa, sizeof(sa), AF_INET);
+    }
+    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    char port_str[6];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    if (ml_getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
+        ESP_LOGW(TAG, "DNS resolve failed for %s", host);
+        if (res) ml_freeaddrinfo(res);
+        return -1;
+    }
+    int sock = -1;
+    for (struct addrinfo *ai = res; ai && sock < 0 && !derp_stopping(ml); ai = ai->ai_next) {
+        sock = derp_dial_addr(ai->ai_addr, ai->ai_addrlen, ai->ai_family);
+    }
+    ml_freeaddrinfo(res);
+    return sock;
+}
+
 esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region) {
-    /* Connect to `region` (the home region, ml_netcheck.c), first DERP node of the
-     * region. Never a region absent from the DERP map: without one, no connection. */
-    char derp_host[sizeof(((ml_derp_node_t *)0)->hostname)] = "";   /* copy: coord may re-parse the map */
-    int derp_port = ML_DERP_PORT;
+    /* Connect to `region` (the home region, ml_netcheck.c). As derphttp dialRegion:
+     * every non-STUN-only node in turn; the attempt fails only when all do. Never a
+     * region absent from the DERP map: without one, no connection. */
+    typedef struct {
+        char host[sizeof(((ml_derp_node_t *)0)->hostname)];
+        char ipv4[sizeof(((ml_derp_node_t *)0)->ipv4)];
+        int port;
+    } node_copy_t;
+    node_copy_t nodes[ML_MAX_DERP_NODES];   /* copies: coord may re-parse the map */
+    int node_count = 0;
     /* Taken before connecting: a rebind or region change during the connect makes
      * this connection stale, and a pending reconnect request then replaces it. */
     uint32_t target_gen = ml->derp_target_gen;
@@ -720,68 +771,40 @@ esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region) {
         if (ml->derp_regions[i].region_id != region) continue;
         for (int n = 0; n < ml->derp_regions[i].node_count; n++) {
             const ml_derp_node_t *node = &ml->derp_regions[i].nodes[n];
-            if (!node->stun_only && node->hostname[0]) {
-                strncpy(derp_host, node->hostname, sizeof(derp_host) - 1);
-                if (node->derp_port > 0) derp_port = node->derp_port;
-                break;
-            }
+            if (node->stun_only || !node->hostname[0]) continue;
+            node_copy_t *nc = &nodes[node_count++];
+            memcpy(nc->host, node->hostname, sizeof(nc->host));
+            nc->host[sizeof(nc->host) - 1] = '\0';
+            memcpy(nc->ipv4, node->ipv4, sizeof(nc->ipv4));
+            nc->ipv4[sizeof(nc->ipv4) - 1] = '\0';
+            nc->port = node->derp_port > 0 ? node->derp_port : ML_DERP_PORT;
         }
         break;
     }
-    if (!derp_host[0]) {
+    if (node_count == 0) {
         ESP_LOGW(TAG, "No DERP node for home region %u (map has %d regions)",
                  region, ml->derp_region_count);
         return ESP_FAIL;
     }
 
     int64_t t_derp_start = esp_timer_get_time();
-
-    ESP_LOGI(TAG, "Connecting to DERP %s:%d (region %u)", derp_host, derp_port, region);
-
-    /* DNS resolve — accept IPv4 or IPv6 (carrier may be IPv6-only) */
-    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
-    struct addrinfo *res = NULL;
-    char port_str[6];
-    snprintf(port_str, sizeof(port_str), "%d", derp_port);
-
-    if (ml_getaddrinfo(derp_host, port_str, &hints, &res) != 0 || !res) {
-        ESP_LOGE(TAG, "DNS resolve failed for %s", derp_host);
-        return ESP_FAIL;
+    int64_t t_derp_dns = t_derp_start;      /* name lookups are part of each node's dial */
+    char derp_host[sizeof(nodes[0].host)] = "";
+    int sock = -1;
+    for (int k = 0; k < node_count && sock < 0; k++) {
+        if (derp_stopping(ml)) return ESP_FAIL;
+        ESP_LOGI(TAG, "Connecting to DERP %s:%d (region %u)", nodes[k].host, nodes[k].port, region);
+        sock = derp_dial_node(ml, nodes[k].host, nodes[k].ipv4, nodes[k].port);
+        if (sock >= 0) memcpy(derp_host, nodes[k].host, sizeof(derp_host));
     }
-
-    if (derp_stopping(ml)) {
-        ml_freeaddrinfo(res);
-        return ESP_FAIL;
-    }
-    int64_t t_derp_dns = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DERP DNS: %lld ms", (t_derp_dns - t_derp_start) / 1000);
-
-    /* TCP connect — use address family from DNS result */
-    int sock = ml_socket(res->ai_family, SOCK_STREAM, 0);
-    if (sock < 0) {
-        ml_freeaddrinfo(res);
-        return ESP_FAIL;
-    }
-
-    /* Set connect timeout */
-    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
-    ml_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    ml_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    if (derp_dial(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        ESP_LOGE(TAG, "TCP connect failed: %d", errno);
-        ml_close_sock(sock);
-        ml_freeaddrinfo(res);
-        return ESP_FAIL;
-    }
-    ml_freeaddrinfo(res);
+    if (sock < 0) return ESP_FAIL;
     if (derp_stopping(ml)) {
         ml_close_sock(sock);
         return ESP_FAIL;
     }
 
     int64_t t_derp_tcp = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DERP TCP connect: %lld ms", (t_derp_tcp - t_derp_dns) / 1000);
+    ESP_LOGI(TAG, "[TIMING] DERP TCP connect (with DNS): %lld ms", (t_derp_tcp - t_derp_dns) / 1000);
 
     /* TLS setup */
     mbedtls_ssl_init(&ml->derp.ssl);
@@ -1018,6 +1041,7 @@ esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region) {
     }
 
     /* Step 3: Read ServerInfo frame (type 0x03) */
+    ml->derp.server_info = false;
     {
         uint8_t si_type;
         uint32_t si_len;
@@ -1026,7 +1050,8 @@ esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region) {
             /* Read and discard ServerInfo payload */
             uint8_t *si_buf = malloc(si_len);
             if (si_buf) {
-                derp_tls_read_all(ml, si_buf, si_len, DERP_CONNECT_TIMEOUT_MS);
+                ml->derp.server_info =
+                    derp_tls_read_all(ml, si_buf, si_len, DERP_CONNECT_TIMEOUT_MS) == (int)si_len;
                 free(si_buf);
             }
             ESP_LOGI(TAG, "ServerInfo received (discarded)");
