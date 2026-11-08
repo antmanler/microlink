@@ -1024,6 +1024,14 @@ int wireguardif_take_send_request(struct netif *netif, u8_t peer_index) {
 	return WIREGUARDIF_SEND_RETRYING;
 }
 
+bool wireguardif_initiation_pending(struct netif *netif, u8_t peer_index) {
+	struct wireguard_peer *peer;
+	if (wireguardif_lookup_peer(netif, peer_index, &peer) != ERR_OK) return false;
+	// Sent within REKEY_TIMEOUT and not yet answered (the reply clears handshake.valid).
+	return peer->handshake.valid && peer->handshake.initiator &&
+	       !wireguardif_can_send_initiation(peer);
+}
+
 err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);

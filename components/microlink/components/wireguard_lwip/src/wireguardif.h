@@ -144,6 +144,10 @@ int wireguardif_take_send_request(struct netif *netif, u8_t peer_index);
 // one would replace the pending handshake state and the first reply would fail.
 err_t wireguardif_initiate(struct netif *netif, u8_t peer_index, const ip_addr_t *direct_ip, u16_t direct_port);
 
+// True while an initiation we sent (on any path) is waiting for its reply, within
+// REKEY_TIMEOUT. A new initiation would replace its handshake state.
+bool wireguardif_initiation_pending(struct netif *netif, u8_t peer_index);
+
 // Point the peer's output at DERP without sending anything (direct path lost).
 err_t wireguardif_use_derp(struct netif *netif, u8_t peer_index);
 

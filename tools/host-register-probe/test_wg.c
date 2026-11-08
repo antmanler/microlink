@@ -278,6 +278,22 @@ static void test_initiate_single_path(void) {
     CHECK(g_initiations == derp0 + 1 && g_direct_initiations == direct0 + 1);
 }
 
+/* The DISCO pong one-shot asks this before sending a direct initiation. */
+static void test_initiation_pending(void) {
+    g_now_ms += REKEY_TIMEOUT * 1000;
+    CHECK(!wireguardif_initiation_pending(&g_netif, g_peer));
+    CHECK(wireguardif_initiate(&g_netif, g_peer, NULL, 0) == ERR_OK);       /* over DERP */
+    CHECK(wireguardif_initiation_pending(&g_netif, g_peer));
+    g_now_ms += REKEY_TIMEOUT * 1000 - 1;
+    CHECK(wireguardif_initiation_pending(&g_netif, g_peer));
+    g_now_ms += 2;
+    CHECK(!wireguardif_initiation_pending(&g_netif, g_peer));             /* timed out */
+    CHECK(wireguardif_initiate(&g_netif, g_peer, NULL, 0) == ERR_OK);
+    peer()->handshake.valid = false;                                      /* answered */
+    CHECK(!wireguardif_initiation_pending(&g_netif, g_peer));
+    CHECK(!wireguardif_initiation_pending(&g_netif, WIREGUARD_MAX_PEERS - 1));
+}
+
 int main(void) {
     setup();
     test_outbound_starts_handshake_and_cap_stops_it();
@@ -285,6 +301,7 @@ int main(void) {
     test_session_present_needs_nothing();
     test_peer_back_from_away();
     test_initiate_single_path();
+    test_initiation_pending();
     printf("%d wireguard checks, %d failed\n", g_total, g_failed);
     return g_failed ? 1 : 0;
 }

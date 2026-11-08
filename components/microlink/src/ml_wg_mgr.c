@@ -1009,7 +1009,11 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                      * Instead, just fire a single handshake init. If the peer
                      * has us configured, it will respond and establish session.
                      * If not, we stop and wait for them to initiate. */
-                    if (!p->tried_initial_handshake) {
+                    /* Not while an initiation (e.g. over DERP) waits for its reply:
+                     * a second one replaces its state and that reply would fail. The
+                     * one-shot stays available for the next pong. */
+                    if (!p->tried_initial_handshake &&
+                        !wireguardif_initiation_pending(netif, (u8_t)p->wg_peer_index)) {
                         p->tried_initial_handshake = true;
                         /* Store endpoint so wireguardif_connect sends to it */
                         wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
@@ -1541,6 +1545,7 @@ void ml_wg_mgr_task(void *arg) {
 
     if (wait_bits & ML_EVT_SHUTDOWN_REQUEST) {
         ESP_LOGI(TAG, "Shutdown requested before registration, exiting");
+        xEventGroupSetBits(ml->events, ML_EVT_EXIT_WG_MGR);
         vTaskDelete(NULL);
         return;  /* Not reached */
     }
@@ -1676,5 +1681,6 @@ void ml_wg_mgr_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "WG Manager task exiting");
+    xEventGroupSetBits(ml->events, ML_EVT_EXIT_WG_MGR);
     vTaskDelete(NULL);
 }
