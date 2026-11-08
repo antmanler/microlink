@@ -273,6 +273,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->config = *config;
     ml->interactive = !(config->auth_key && config->auth_key[0]);
     portMUX_INITIALIZE(&ml->id_lock);
+    ml_peer_updates_init(ml);   /* before any path can reach stop or destroy */
     if (ml->config.max_peers == 0) ml->config.max_peers = ML_MAX_PEERS;
     if (ml->config.max_peers > ML_MAX_PEERS) ml->config.max_peers = ML_MAX_PEERS;
     ml->config.enable_derp = true;  /* Always need DERP for relay */
@@ -384,7 +385,6 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->wg_rx_queue = xQueueCreate(ML_WG_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
     ml->stun_rx_queue = xQueueCreate(ML_STUN_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
     ml->coord_cmd_queue = xQueueCreate(ML_COORD_CMD_QUEUE_DEPTH, sizeof(ml_coord_cmd_t));
-    ml_peer_updates_init(ml);
 
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue ||
         !ml->stun_rx_queue || !ml->coord_cmd_queue) {
@@ -512,10 +512,10 @@ skip_bsd_socket:
     xQueueSend(ml->coord_cmd_queue, &cmd, 0);
 
     /* Start HTTP config server (binds port 80, serves config page + REST API).
-     * ML_CONFIG_HTTPD=n skips only the server: ml_config_httpd_init() already
-     * loaded the NVS settings above, so a provisioned device runs normally and
-     * keeps the ~7-8 KB of internal RAM the httpd task would pin. */
-#if CONFIG_ML_CONFIG_HTTPD
+     * Without CONFIG_ML_CONFIG_HTTPD only the server is skipped: ml_config_httpd_init()
+     * already loaded the NVS settings above, so a provisioned device runs normally
+     * and keeps the ~7-8 KB of internal RAM the httpd task would pin. */
+#ifdef CONFIG_ML_CONFIG_HTTPD
     if (ml->config_httpd) {
         ml_config_httpd_start(ml->config_httpd, ml);
     }

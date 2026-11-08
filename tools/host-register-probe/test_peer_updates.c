@@ -77,7 +77,8 @@ static microlink_t *new_ml(void) {
 }
 
 /* A first netmap queues one update per tailnet peer before anything drains. Every one
- * of them arrives, in order; none is dropped at the old depths (32 and 400) or beyond. */
+ * of them arrives, in order. The burst is the tailnet's peer count, not the peer table
+ * size, so BURST is well above ML_MAX_PEERS (16 in the host config). */
 static void test_burst_before_any_consumer(void) {
     enum { BURST = 500 };
     microlink_t *ml = new_ml();

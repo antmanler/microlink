@@ -2,14 +2,20 @@
  * @file ml_peer_updates.c
  * @brief Peer updates from the coord task to the wg_mgr task
  *
- * The coord task appends one update per netmap peer before wg_mgr starts to
- * drain (wg_mgr waits for ML_EVT_COORD_REGISTERED, which coord sets after the
- * first netmap). The count is the tailnet's peer count, so no fixed depth
- * fits: a full queue drops updates, and a send that blocks deadlocks, since
- * coord would wait for wg_mgr while wg_mgr waits for coord.
+ * The coord task appends one update per netmap peer, and wg_mgr takes nothing
+ * until coord sets ML_EVT_COORD_REGISTERED, so a whole netmap waits here first.
+ * The count is the tailnet's peer count, so no fixed depth fits: a full queue
+ * drops updates, and a send that blocks deadlocks, since coord would wait for
+ * wg_mgr while wg_mgr waits for coord.
  *
- * Updates are PSRAM allocations already, so a FIFO list linked through
- * ml_peer_update_t.next costs nothing per item. peer_updates_lock covers
+ * Without that bit (a login waiting for approval) every reconnect reads the
+ * full netmap again. Coord flushes the older updates first (do_fetch_peers),
+ * and the end of a session flushes too (microlink_stop), so before
+ * registration the list holds one netmap plus the deltas after it.
+ *
+ * Updates come from ml_psram_calloc: PSRAM, with internal RAM as the fallback.
+ * A list linked through ml_peer_update_t.next adds one pointer (4 bytes on the
+ * target) to each update and allocates nothing more. peer_updates_lock covers
  * only pointer operations: producers append, the consumer detaches the whole
  * list and walks it outside the lock. A critical section is the lock
  * microlink uses for such short cross-task state (see id_lock).

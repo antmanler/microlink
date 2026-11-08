@@ -1179,8 +1179,9 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
             forget_priority_peer(ml);       /* renamed, or the priority name changed */
         }
 
-        /* Hand to the wg_mgr task. Never blocks or drops: wg_mgr starts to drain only
-         * after ML_EVT_COORD_REGISTERED, which is set after the first netmap is parsed. */
+        /* Hand to the wg_mgr task. Never blocks or drops. wg_mgr takes nothing before
+         * ML_EVT_COORD_REGISTERED, so a whole netmap waits here first (see do_fetch_peers
+         * for a netmap that is read again before that). */
         ml_peer_updates_push(ml, update);
     }
 
@@ -1814,6 +1815,13 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
             free(resp_buf);
             return -1;
         }
+    }
+
+    /* Until registration wg_mgr takes nothing, so updates still queued come from an
+     * earlier netmap (every reconnect reads the full list again). This one replaces
+     * them. Coord is the only producer and the one that sets the bit. */
+    if (!(xEventGroupGetBits(ml->events) & ML_EVT_COORD_REGISTERED)) {
+        ml_peer_updates_flush(ml);
     }
 
     /* Parse peers */

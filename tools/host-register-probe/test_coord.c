@@ -48,6 +48,7 @@ extern EventBits_t shim_event_bits_set, shim_event_bits_get;
 static microlink_t *new_ml(bool interactive) {
     microlink_t *ml = calloc(1, sizeof(*ml));
     portMUX_INITIALIZE(&ml->id_lock);
+    ml_peer_updates_init(ml);
     ml->coord_sock = -1;
     ml->interactive = interactive;
     ml->config.device_name = "dev-1";
@@ -449,6 +450,49 @@ static void test_fetch_self_node(void) {
     free(ml);
 }
 
+/* ---- Peer updates queued before registration ------------------------------- */
+
+/* The first update's hostname of the pending list, then the pending count. */
+static int pending_updates(microlink_t *ml, char first_host[64]) {
+    ml_peer_update_t *list = ml_peer_updates_take_all(ml);
+    int n = 0;
+    if (first_host) first_host[0] = '\0';
+    while (list) {
+        ml_peer_update_t *next = list->next;
+        if (n == 0 && first_host) snprintf(first_host, 64, "%s", list->hostname);
+        free(list);
+        list = next;
+        n++;
+    }
+    return n;
+}
+
+static void test_refetch_before_registration(void) {
+    const char *first = "{\"Peers\":[{\"Name\":\"a1.tail1234.ts.net.\"},"
+                        "{\"Name\":\"a2.tail1234.ts.net.\"},{\"Name\":\"a3.tail1234.ts.net.\"}]}";
+    const char *second = "{\"Peers\":[{\"Name\":\"b1.tail1234.ts.net.\"},"
+                         "{\"Name\":\"b2.tail1234.ts.net.\"}]}";
+    char host[64];
+
+    /* Not registered (a login waiting for approval): every reconnect reads the full
+     * list again, and only the latest netmap's updates stay queued. */
+    microlink_t *ml = new_ml(false);
+    shim_event_bits_get = 0;
+    CHECK(fetch_with(ml, first) == 0);
+    CHECK(fetch_with(ml, second) == 0);
+    CHECK(pending_updates(ml, host) == 2 && !strcmp(host, "b1.tail1234.ts.net"));
+    free(ml);
+
+    /* Registered: wg_mgr is draining, so nothing queued is discarded. */
+    ml = new_ml(false);
+    shim_event_bits_get = ML_EVT_COORD_REGISTERED;
+    CHECK(fetch_with(ml, first) == 0);
+    CHECK(fetch_with(ml, second) == 0);
+    CHECK(pending_updates(ml, host) == 5 && !strcmp(host, "a1.tail1234.ts.net"));
+    shim_event_bits_get = 0;
+    free(ml);
+}
+
 /* ---- A: DERP home region by measured latency (ml_netcheck.c) -------------- */
 
 extern int stub_binding_sent;
@@ -701,7 +745,6 @@ static const ml_peer_update_t *update_at(int i) {
 
 static void test_priority_marked_on_every_netmap(void) {
     microlink_t *ml = new_ml(false);
-    ml_peer_updates_init(ml);
     const char *map = "{\"Peers\":["
         "{\"Name\":\"laptop.tail1234.ts.net.\",\"Addresses\":[\"100.64.0.2/32\"]},"
         "{\"Name\":\"P4-Dock.tail1234.ts.net.\",\"Addresses\":[\"100.64.0.3/32\"]},"
@@ -728,8 +771,9 @@ static void test_priority_marked_on_every_netmap(void) {
 }
 
 /* A netmap lists every tailnet peer, and the coord task queues them all before wg_mgr
- * drains: far more than any fixed queue depth. Every update must arrive, in JSON order
- * across the three producers (Peers, PeersRemoved, PeersChangedPatch). */
+ * drains: the count is the tailnet's, not the peer table's (ML_MAX_PEERS). Every update
+ * must arrive, in JSON order across the three producers (Peers, PeersRemoved,
+ * PeersChangedPatch). */
 static void node_key(char *out, size_t n, int i) {
     snprintf(out, n, "nodekey:%02x%02x%.60s", i & 255, (i >> 8) & 255,
              "abababababababababababababababababababababababababababababab");
@@ -767,7 +811,6 @@ static void test_netmap_never_drops_updates(void) {
     CHECK(len < cap);
 
     microlink_t *ml = new_ml(false);
-    ml_peer_updates_init(ml);
     parse_netmap(ml, json);
     CHECK(g_update_count == ADDS + REMOVES + PATCHES);
 
@@ -1466,6 +1509,7 @@ int main(void) {
     test_begin_login();
     test_poll_map_update();
     test_fetch_self_node();
+    test_refetch_before_registration();
     test_recv_results();
     printf("%d coord checks, %d failed\n", g_total, g_failed);
     return g_failed ? 1 : 0;
