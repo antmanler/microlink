@@ -59,6 +59,8 @@ void ml_identity_clear_old_node_key(microlink_t *ml) {
     memset(ml->old_node_pub, 0, sizeof(ml->old_node_pub));
 }
 
+EventBits_t shim_event_bits_set;
+
 /* Records ml_coord_cmd_t values sent to stub_cmd_queue; other queues are ignored. */
 void *stub_cmd_queue;
 int stub_cmd_sent;

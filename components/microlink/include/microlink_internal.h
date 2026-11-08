@@ -267,6 +267,7 @@ typedef struct {
     char hostname[64];
     bool active;
     bool priority;                  /* never evicted; may evict another peer */
+    bool has_session;               /* a WG keypair exists (refreshed before an eviction) */
 
     /* Endpoints */
     struct {
@@ -281,7 +282,7 @@ typedef struct {
     uint64_t last_ping_sent_ms;     /* Last DISCO ping we sent */
     uint64_t last_pong_recv_ms;     /* Last DISCO pong we received */
     uint64_t trust_until_ms;        /* Direct path trusted until */
-    uint64_t last_send_ms;          /* Last data sent to this peer */
+    uint64_t last_send_ms;          /* Last WG traffic with this peer (refreshed before an eviction) */
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
 
     /* Best direct path */
@@ -311,6 +312,7 @@ typedef struct {
     uint16_t derp_port;     /* 0 = default 443 */
     bool stun_only;         /* true if node only serves STUN, not DERP */
     uint32_t stun_ipv4;     /* IPv4 for latency probes, host order; 0 = not resolved */
+    bool stun_dns_failed;   /* host name lookup failed for this map: not retried */
 } ml_derp_node_t;
 
 typedef struct {
@@ -372,6 +374,7 @@ typedef struct {
     uint64_t last_round_ms;                 /* start of the last round */
     uint64_t last_full_ms;
     bool ran;                               /* a round has run since start */
+    bool home_changed;                      /* set by a map change, reported by the next end() */
     bool next_full;
 } ml_netcheck_t;
 
@@ -591,6 +594,8 @@ esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t server_ip, uint16_t por
 
 /* ml_netcheck.c: pure parts (no I/O) */
 bool ml_nc_node_can_stun(const ml_derp_node_t *n);
+void ml_nc_keep_resolved(ml_derp_node_t *n, uint16_t region_id,
+                         const ml_derp_region_t *old, int old_count);
 bool ml_nc_region_can_home(const ml_derp_region_t *r);
 int ml_nc_make_plan(const ml_derp_region_t *regions, int count,
                     const ml_nc_sample_t *last, int last_count, uint16_t home,

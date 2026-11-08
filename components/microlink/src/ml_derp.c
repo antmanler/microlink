@@ -645,6 +645,9 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     char derp_host[sizeof(((ml_derp_node_t *)0)->hostname)] = "";   /* copy: coord may re-parse the map */
     int derp_port = ML_DERP_PORT;
     uint16_t region = ml->derp_home_region;
+    /* Taken before connecting: a rebind or region change during the connect makes
+     * this connection stale, and a pending reconnect request then replaces it. */
+    uint32_t target_gen = ml->derp_target_gen;
 
     for (int i = 0; region != 0 && i < ml->derp_region_count; i++) {
         if (ml->derp_regions[i].region_id != region) continue;
@@ -1000,7 +1003,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     }
 
     ml->derp.region = region;
-    ml->derp.target_gen = ml->derp_target_gen;
+    ml->derp.target_gen = target_gen;
     ml->derp.connected = true;
     ml->derp.last_recv_ms = ml_get_time_ms();
     xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECTED);

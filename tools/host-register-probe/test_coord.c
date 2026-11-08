@@ -596,7 +596,8 @@ static void test_netcheck_choice(void) {
     CHECK(ml->derp_home_region == 907);
     t = 2000000000;
     nc_round(ml, t, 0, 0, 0, 0);
-    CHECK(!ml_netcheck_end(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL) && ml->derp_home_region == 907);
+    /* The map set the home region (none before): reported once so DERP connects there. */
+    CHECK(ml_netcheck_end(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL) && ml->derp_home_region == 907);
     free(ml);
 
     /* Pure choice: an Avoid region never wins even when fastest; a silent old home
@@ -765,7 +766,78 @@ static void test_rebind_clears_stun(void) {
     free(ml);
 }
 
+/* ---- review fixes: home change always reconnects DERP; map edits; eviction --- */
+
+extern EventBits_t shim_event_bits_set;
+
+static void test_home_change_reconnects_derp(void) {
+    microlink_t *ml = new_ml(false);
+    ml->derp_home_region = 902;
+    uint32_t gen = ml->derp_target_gen;
+    /* DERP not connected yet (a connect to the old region may be in flight). */
+    ml->derp.connected = false;
+    shim_event_bits_set = 0;
+    coord_home_changed(ml, NULL, false);
+    CHECK(shim_event_bits_set & ML_EVT_DERP_RECONNECT);
+    CHECK(ml->derp_target_gen == gen + 1);
+    free(ml);
+}
+
+static void test_map_edits(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":[]}") == 0);
+    int64_t t = 3000000000LL;
+    nc_round(ml, t, 0xC0000201u, 80000, 0xC6336401u, 20000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+
+    /* The map loses region 902: home moves to the first usable region, and the next
+     * round reports the change even if it measures nothing (DERP must reconnect). */
+    CHECK(fetch_with(ml, "{\"DERPMap\":{\"Regions\":{\"901\":{\"RegionID\":901,\"Nodes\":["
+                         "{\"HostName\":\"d1a.example.invalid\",\"IPv4\":\"192.0.2.1\"}]}}},"
+                         "\"Peers\":[]}") == 0);
+    CHECK(ml->derp_home_region == 901 && ml->derp_region_count == 1);
+    CHECK(ml->derp_regions[0].nodes[0].stun_ipv4 == 0xC0000201u);   /* kept, no new lookup */
+    t += 30000000;
+    nc_round(ml, t, 0, 0, 0, 0);
+    CHECK(ml_netcheck_end(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL) && ml->derp_home_region == 901);
+    t += 30000000;
+    nc_round(ml, t, 0, 0, 0, 0);
+    CHECK(!ml_netcheck_end(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL));    /* reported once */
+
+    /* An empty Regions map is ignored: home and regions stay. */
+    CHECK(fetch_with(ml, "{\"DERPMap\":{\"Regions\":{}},\"Peers\":[]}") == 0);
+    CHECK(ml->derp_home_region == 901 && ml->derp_region_count == 1);
+    free(ml);
+}
+
+static void test_eviction_prefers_idle_peers(void) {
+    ml_peer_t peers[ML_MAX_PEERS];
+    bool evict;
+    memset(peers, 0, sizeof(peers));
+    for (int i = 0; i < ML_MAX_PEERS; i++) {
+        peers[i].active = true;
+        peers[i].has_session = true;
+        peers[i].last_send_ms = 5000 + i;
+    }
+    /* Oldest activity overall is peer 0, but it has a session; peer 9 has none. */
+    peers[0].last_send_ms = 10;
+    peers[9].has_session = false;
+    peers[9].last_send_ms = 9000;
+    CHECK(ml_peer_admit_slot(peers, ML_MAX_PEERS, true, &evict) == 9 && evict);
+    /* Among peers without a session, the least recently active goes. */
+    peers[12].has_session = false;
+    peers[12].last_send_ms = 100;
+    CHECK(ml_peer_admit_slot(peers, ML_MAX_PEERS, true, &evict) == 12 && evict);
+    /* Only live sessions left: the least recently active one, as the last resort. */
+    peers[9].has_session = peers[12].has_session = true;
+    CHECK(ml_peer_admit_slot(peers, ML_MAX_PEERS, true, &evict) == 0 && evict);
+}
+
 int main(void) {
+    test_home_change_reconnects_derp();
+    test_map_edits();
+    test_eviction_prefers_idle_peers();
     test_rebind_clears_stun();
     test_priority_name_match();
     test_priority_setter();

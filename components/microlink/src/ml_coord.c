@@ -1333,7 +1333,16 @@ static void parse_derp_map(microlink_t *ml, cJSON *map_json) {
     cJSON *derp_map = cJSON_GetObjectItem(map_json, "DERPMap");
     if (derp_map) {
         cJSON *regions = cJSON_GetObjectItem(derp_map, "Regions");
+        if (regions && cJSON_GetArraySize(regions) == 0) {
+            /* No region to use: keep the previous map and home region. */
+            ESP_LOGW(TAG, "DERPMap without regions ignored");
+            regions = NULL;
+        }
         if (regions) {
+            /* Keep resolved STUN addresses of nodes that did not change (no repeat DNS). */
+            ml_derp_region_t *old = ml_psram_malloc(sizeof(ml->derp_regions));
+            int old_count = ml->derp_region_count;
+            if (old) memcpy(old, ml->derp_regions, sizeof(ml->derp_regions));
             ml->derp_region_count = 0;
             cJSON *region_obj;
             cJSON_ArrayForEach(region_obj, regions) {
@@ -1385,6 +1394,7 @@ static void parse_derp_map(microlink_t *ml, cJSON *map_json) {
 
                         cJSON *so = cJSON_GetObjectItem(node_obj, "STUNOnly");
                         if (so && cJSON_IsTrue(so)) n->stun_only = true;
+                        if (old) ml_nc_keep_resolved(n, r->region_id, old, old_count);
 
                         r->node_count++;
                     }
@@ -1396,8 +1406,9 @@ static void parse_derp_map(microlink_t *ml, cJSON *map_json) {
 
                 ml->derp_region_count++;
             }
+            free(old);
             ESP_LOGI(TAG, "DERPMap: parsed %d regions", ml->derp_region_count);
-            ml_netcheck_on_derp_map(ml);
+            ml_netcheck_on_derp_map(ml);   /* a lost home region is reported by the next round */
         }
     }
 
@@ -2237,6 +2248,7 @@ static void coord_handle_key_expired(microlink_t *ml, ml_noise_state_t *noise, c
  * and with send_update a new endpoint goes to the control plane at once. */
 static void coord_handle_stun_packet(microlink_t *ml, ml_noise_state_t *noise,
                                      const ml_rx_packet_t *pkt, bool send_update) {
+    if (!pkt->data || pkt->len == 0) return;     /* shutdown wake-up (microlink_stop) */
     if (ml_netcheck_on_stun(ml, pkt->data, pkt->len, esp_timer_get_time())) return;
 
     uint32_t pub_ip;
@@ -2318,9 +2330,9 @@ static void coord_handle_stun_packet(microlink_t *ml, ml_noise_state_t *noise,
 static void coord_home_changed(microlink_t *ml, ml_noise_state_t *noise, bool long_poll_open) {
     ESP_LOGI(TAG, "Home DERP region: %u", ml->derp_home_region);
     ml->derp_target_gen++;
-    if (ml->derp.connected && ml->derp.region != ml->derp_home_region) {
-        xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
-    }
+    /* Always: a connect in flight (to the old region) must not survive. The DERP task
+     * keeps a connection that already reached the new home (derp_target_gen). */
+    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
     if (long_poll_open) do_send_endpoint_update(ml, noise, true);
 }
 
@@ -2339,6 +2351,8 @@ static bool coord_run_netcheck(microlink_t *ml, ml_noise_state_t *noise, bool lo
                 coord_handle_stun_packet(ml, noise, &pkt, long_poll_open);
                 free(pkt.data);
             }
+            /* microlink_stop() posts an empty item to stun_rx_queue to end the wait. */
+            if (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) break;
         }
     }
     if (!ml_netcheck_end(ml, esp_timer_get_time())) return false;
@@ -2983,11 +2997,10 @@ void ml_coord_task(void *arg) {
                 /* Wait on command queue with backoff timeout (interruptible!) */
                 ml_coord_cmd_t wake_cmd;
                 if (xQueueReceive(ml->coord_cmd_queue, &wake_cmd, pdMS_TO_TICKS(backoff_ms)) == pdTRUE) {
-                    if (wake_cmd == ML_CMD_DISCONNECT) {
-                        state = COORD_IDLE;
-                        ml->state = ML_STATE_IDLE;
-                        break;
-                    }
+                    /* Every command counts here too (REBIND must clear the old STUN
+                     * endpoint); DISCONNECT leaves for IDLE. */
+                    coord_handle_command(ml, &state, wake_cmd);
+                    if (state != COORD_RECONNECTING) break;
                 }
 
                 reconnect_attempts++;

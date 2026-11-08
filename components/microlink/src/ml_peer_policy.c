@@ -65,8 +65,10 @@ void ml_copy_priority_name(microlink_t *ml, char *buf, size_t len) {
     portEXIT_CRITICAL(&ml->id_lock);
 }
 
-/* Slot for a new peer: a free one; else, for a priority peer only, the least recently
- * active non-priority peer (*evict = true). -1 when the peer is not admitted. */
+/* Slot for a new peer: a free one; else, for a priority peer only, a non-priority
+ * peer (*evict = true): one without a WireGuard session first, then the least
+ * recently active. A peer with a live session goes only when no other candidate
+ * exists. -1 when the peer is not admitted. */
 int ml_peer_admit_slot(const ml_peer_t *peers, int max, bool incoming_priority, bool *evict) {
     *evict = false;
     for (int i = 0; i < max; i++) {
@@ -76,13 +78,18 @@ int ml_peer_admit_slot(const ml_peer_t *peers, int max, bool incoming_priority, 
 
     int victim = -1;
     uint64_t oldest = UINT64_MAX;
+    bool victim_session = true;
     for (int i = 0; i < max; i++) {
         if (peers[i].priority) continue;
         uint64_t last = peers[i].last_send_ms;
         if (peers[i].last_pong_recv_ms > last) last = peers[i].last_pong_recv_ms;
-        if (last < oldest) {
+        bool better = victim < 0 ||
+                      (victim_session && !peers[i].has_session) ||
+                      (victim_session == peers[i].has_session && last < oldest);
+        if (better) {
             oldest = last;
             victim = i;
+            victim_session = peers[i].has_session;
         }
     }
     if (victim >= 0) *evict = true;

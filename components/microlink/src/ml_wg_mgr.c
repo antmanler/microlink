@@ -411,6 +411,29 @@ static int find_peer_by_disco_key(microlink_t *ml, const uint8_t *disco_key) {
     return -1;
 }
 
+/* Copy each peer's WireGuard state into the table before choosing an eviction victim:
+ * whether a keypair exists and when traffic last moved (wireguard-lwip last_tx/last_rx,
+ * converted from its clock to ml_get_time_ms()). */
+static void refresh_peer_activity(microlink_t *ml) {
+    if (!ml->wg_netif) return;
+    struct wireguard_device *dev = (struct wireguard_device *)((struct netif *)ml->wg_netif)->state;
+    if (!dev) return;
+    uint64_t now_ms = ml_get_time_ms();
+    uint32_t wg_now = wireguard_sys_now();
+    for (int i = 0; i < ML_MAX_PEERS; i++) {
+        ml_peer_t *p = &ml->peers[i];
+        if (!p->active || p->wg_peer_index < 0 || p->wg_peer_index >= WIREGUARD_MAX_PEERS) continue;
+        const struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
+        p->has_session = wp->curr_keypair.valid || wp->prev_keypair.valid;
+        uint32_t last = wp->last_tx > wp->last_rx ? wp->last_tx : wp->last_rx;
+        uint32_t age = wg_now - last;
+        if (last != 0 && age <= now_ms) {
+            uint64_t at = now_ms - age;
+            if (at > p->last_send_ms) p->last_send_ms = at;
+        }
+    }
+}
+
 static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Peer allowlist filter: don't waste WG slots on non-allowed peers.
      * Still process updates for existing peers (they may become allowed later). */
@@ -425,10 +448,12 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 
     /* Check if peer already exists */
     int idx = find_peer_by_key(ml, update->public_key);
+    bool is_new = idx < 0;
     if (idx >= 0) {
         ESP_LOGI(TAG, "Updating existing peer (idx=%d)", idx);
     } else {
         bool evict = false;
+        refresh_peer_activity(ml);
         idx = ml_peer_admit_slot(ml->peers, ML_MAX_PEERS, priority, &evict);
         if (idx >= 0 && evict) {
             ESP_LOGW(TAG, "Evicting LRU peer idx=%d for the priority peer", idx);
@@ -466,15 +491,19 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         p->endpoints[i].is_ipv6 = update->endpoints[i].is_ipv6;
     }
 
-    /* Initialize DISCO rate limiting state */
-    p->last_ping_sent_ms = 0;
-    p->last_pong_recv_ms = 0;
-    p->trust_until_ms = 0;
-    p->last_send_ms = 0;
-    p->last_upgrade_ms = 0;
-    p->has_direct_path = false;
-    p->best_ip = 0;
-    p->best_port = 0;
+    /* Initialize DISCO rate limiting state for a new peer only: a netmap refresh of a
+     * known peer is no news about its paths or activity (eviction reads them). */
+    if (is_new) {
+        p->last_ping_sent_ms = 0;
+        p->last_pong_recv_ms = 0;
+        p->trust_until_ms = 0;
+        p->last_send_ms = 0;
+        p->last_upgrade_ms = 0;
+        p->has_direct_path = false;
+        p->has_session = false;
+        p->best_ip = 0;
+        p->best_port = 0;
+    }
     p->wg_peer_index = -1;
 
     ESP_LOGI(TAG, "Peer added: idx=%d endpoints=%d derp=%d",

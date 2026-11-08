@@ -607,6 +607,11 @@ esp_err_t microlink_stop(microlink_t *ml) {
 
     ESP_LOGI(TAG, "Stopping...");
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
+    /* End a netcheck round blocked on stun_rx_queue (an empty item, see ml_coord.c). */
+    if (ml->stun_rx_queue) {
+        ml_rx_packet_t wake = {0};
+        xQueueSend(ml->stun_rx_queue, &wake, 0);
+    }
 
     /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
      * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call

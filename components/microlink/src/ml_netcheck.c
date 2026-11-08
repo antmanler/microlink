@@ -38,6 +38,24 @@ static bool region_skipped(const ml_derp_region_t *r) {
     return r->avoid || r->no_measure;
 }
 
+/* A re-parsed node with the same region, host name and IPv4 field keeps its
+ * resolved address: no repeated DNS lookup for every netmap. */
+void ml_nc_keep_resolved(ml_derp_node_t *n, uint16_t region_id,
+                         const ml_derp_region_t *old, int old_count) {
+    for (int i = 0; i < old_count; i++) {
+        if (old[i].region_id != region_id) continue;
+        for (int j = 0; j < old[i].node_count; j++) {
+            const ml_derp_node_t *o = &old[i].nodes[j];
+            if (o->stun_ipv4 != 0 && !strcmp(o->hostname, n->hostname) &&
+                !strcmp(o->ipv4, n->ipv4)) {
+                n->stun_ipv4 = o->stun_ipv4;
+                return;
+            }
+        }
+        return;
+    }
+}
+
 bool ml_nc_region_can_home(const ml_derp_region_t *r) {
     if (region_skipped(r)) return false;
     for (int i = 0; i < r->node_count; i++) {
@@ -145,6 +163,7 @@ static int region_index(const ml_derp_region_t *regions, int count, uint16_t id)
 }
 
 uint16_t ml_nc_fallback_home(const ml_derp_region_t *regions, int count, uint16_t prev) {
+    if (count == 0) return prev;              /* no map: nothing better to say */
     int pi = region_index(regions, count, prev);
     if (pi >= 0 && ml_nc_region_can_home(&regions[pi])) return prev;
     for (int i = 0; i < count; i++) {
@@ -195,6 +214,7 @@ bool ml_netcheck_on_derp_map(microlink_t *ml) {
     if (home == ml->derp_home_region) return false;
     ESP_LOGI(TAG, "Home DERP region %u -> %u (DERP map)", ml->derp_home_region, home);
     ml->derp_home_region = home;
+    nc->home_changed = true;    /* the coord task reconnects DERP after the next round */
     return true;
 }
 
@@ -212,7 +232,7 @@ bool ml_netcheck_due(const microlink_t *ml, uint64_t now_ms) {
 /* A literal IPv4 is used as is; anything else that is not empty disables IPv4
  * (tailcfg.DERPNode.IPv4, "none" by convention); empty means look up the host name. */
 static void resolve_node(ml_derp_node_t *n) {
-    if (n->stun_ipv4 != 0 || n->stun_port < 0) return;
+    if (n->stun_ipv4 != 0 || n->stun_port < 0 || n->stun_dns_failed) return;
     unsigned a, b, c, d;
     char extra;
     if (n->ipv4[0]) {
@@ -233,6 +253,7 @@ static void resolve_node(ml_derp_node_t *n) {
     } else if (res) {
         ml_freeaddrinfo(res);
     }
+    if (n->stun_ipv4 == 0) n->stun_dns_failed = true;   /* retried with the next map */
 }
 
 bool ml_netcheck_begin(microlink_t *ml, int64_t now_us) {
@@ -252,7 +273,10 @@ bool ml_netcheck_begin(microlink_t *ml, int64_t now_us) {
     for (int i = 0; i < ml->derp_region_count; i++) {
         ml_derp_region_t *r = &ml->derp_regions[i];
         if (region_skipped(r)) continue;
-        for (int j = 0; j < r->node_count; j++) resolve_node(&r->nodes[j]);
+        for (int j = 0; j < r->node_count; j++) {
+            if (ml->events && (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) break;
+            resolve_node(&r->nodes[j]);
+        }
     }
 
     nc->probes = ml_psram_calloc(ML_NC_MAX_PROBES, sizeof(ml_nc_probe_t));
@@ -342,7 +366,8 @@ bool ml_netcheck_end(microlink_t *ml, int64_t now_us) {
                                     prev, heard);
     ESP_LOGI(TAG, "Round done: %d regions replied, home %u", nc->last_count, home);
     memset(nc->lat_us, 0, sizeof(nc->lat_us));
-    if (home == prev) return false;
+    bool changed = nc->home_changed || home != prev;
+    nc->home_changed = false;
     ml->derp_home_region = home;
-    return true;
+    return changed;
 }

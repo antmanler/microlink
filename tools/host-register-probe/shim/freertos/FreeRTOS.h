@@ -38,7 +38,11 @@ static inline void vTaskDelay(TickType_t ms) { usleep(ms * 1000u); }
 static inline void vTaskDelete(TaskHandle_t t) { (void)t; }
 static inline int xPortGetCoreID(void) { return 0; }
 static inline EventBits_t xEventGroupGetBits(EventGroupHandle_t e) { (void)e; return 0; }
-static inline EventBits_t xEventGroupSetBits(EventGroupHandle_t e, EventBits_t b) { (void)e; return b; }
+/* Bits set on any event group are recorded for the tests (host_stubs.c). */
+extern EventBits_t shim_event_bits_set;
+static inline EventBits_t xEventGroupSetBits(EventGroupHandle_t e, EventBits_t b) {
+    (void)e; shim_event_bits_set |= b; return b;
+}
 static inline EventBits_t xEventGroupClearBits(EventGroupHandle_t e, EventBits_t b) { (void)e; return b; }
 static inline EventBits_t xEventGroupWaitBits(EventGroupHandle_t e, EventBits_t b, BaseType_t c,
                                               BaseType_t a, TickType_t t) {
