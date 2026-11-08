@@ -36,6 +36,7 @@ static const char *TAG = "ml_net_sw";
 
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
+#define TASK_EXITED_BIT     BIT2    /* net_switch_task is gone (ml_net_switch_stop waits) */
 #define NET_SW_STACK_SIZE   6144
 #define WIFI_DISCONNECT_DEBOUNCE_MS  5000  /* Wait 5s before declaring WiFi dead */
 
@@ -283,6 +284,7 @@ static esp_err_t vpn_release(void)
 
 static esp_err_t vpn_start(void)
 {
+    if (s_ctx.ml) return ESP_ERR_INVALID_STATE;     /* a refused destroy left it running */
     const char *name = s_ctx.device_name[0] ? s_ctx.device_name : NULL;
 
     /* For cellular, prefer IMEI-based name */
@@ -331,6 +333,7 @@ static esp_err_t vpn_start(void)
             return ESP_OK;
         }
         vTaskDelay(pdMS_TO_TICKS(500));
+        if (!s_ctx.running) break;                  /* ml_net_switch_stop() waits for us */
     }
 
     ESP_LOGW(TAG, "VPN connection timeout (%ds)", timeout_secs);
@@ -338,9 +341,9 @@ static esp_err_t vpn_start(void)
     return ESP_ERR_TIMEOUT;
 }
 
-static void vpn_stop(void)
+static esp_err_t vpn_stop(void)
 {
-    if (s_ctx.ml) vpn_release();
+    return s_ctx.ml ? vpn_release() : ESP_OK;
 }
 
 /* ============================================================================
@@ -468,8 +471,8 @@ try_cellular:
         s_ctx.on_disconnected(s_ctx.user_data);
     }
 
-    /* Retry after 30s */
-    vTaskDelay(pdMS_TO_TICKS(30000));
+    /* Retry after 30s (ml_net_switch_stop's notification ends the wait) */
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30000));
     if (s_ctx.running) {
         cellular_stop();
         s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
@@ -514,7 +517,7 @@ state_loop:
                     } else {
                         ESP_LOGE(TAG, "Rebind failed (%s), full restart",
                                  esp_err_to_name(rb_err));
-                        vpn_stop();
+                        if (vpn_stop() != ESP_OK) break;     /* handle still live: leave the transport */
                         wifi_stop();
                         goto try_cellular;
                     }
@@ -524,7 +527,7 @@ state_loop:
                     if (s_ctx.on_disconnected) {
                         s_ctx.on_disconnected(s_ctx.user_data);
                     }
-                    vpn_stop();
+                    if (vpn_stop() != ESP_OK) break;     /* handle still live: leave the transport */
                     wifi_stop();
                     goto try_cellular;
                 }
@@ -568,7 +571,7 @@ state_loop:
                         ESP_LOGW(TAG, "Rebind to WiFi failed (%s), reverting to cellular",
                                  esp_err_to_name(rb_err));
                         wifi_stop();
-                        vpn_stop();
+                        if (vpn_stop() != ESP_OK) break;     /* handle still live: leave the transport */
                         goto try_cellular;
                     }
                 } else {
@@ -591,6 +594,7 @@ state_loop:
 
     ESP_LOGI(TAG, "Network switch task exiting");
     s_ctx.task_handle = NULL;
+    xEventGroupSetBits(s_ctx.wifi_events, TASK_EXITED_BIT);
     vTaskDelete(NULL);
 }
 
@@ -662,7 +666,11 @@ void ml_net_switch_deinit(void)
 {
     if (!s_ctx.initialized) return;
 
-    ml_net_switch_stop();
+    /* A live handle (destroy refused) is never dropped: keep everything. */
+    if (ml_net_switch_stop() != ESP_OK || s_ctx.ml) {
+        ESP_LOGE(TAG, "deinit refused: MicroLink is still running");
+        return;
+    }
 
     if (s_ctx.health_timer) {
         xTimerDelete(s_ctx.health_timer, portMAX_DELAY);
@@ -686,6 +694,7 @@ esp_err_t ml_net_switch_start(void)
     if (s_ctx.running) return ESP_ERR_INVALID_STATE;
 
     s_ctx.running = true;
+    xEventGroupClearBits(s_ctx.wifi_events, TASK_EXITED_BIT);
 
     BaseType_t ret = xTaskCreate(net_switch_task, "net_sw",
                                   NET_SW_STACK_SIZE, NULL, 5, &s_ctx.task_handle);
@@ -699,7 +708,12 @@ esp_err_t ml_net_switch_start(void)
 
 esp_err_t ml_net_switch_stop(void)
 {
-    if (!s_ctx.running) return ESP_OK;
+    if (!s_ctx.running && !s_ctx.ml) return ESP_OK;   /* also after a refused destroy */
+    /* From the task itself (a callback) it could neither wait for the task nor free
+     * the handle the task is still using. */
+    if (s_ctx.task_handle && s_ctx.task_handle == xTaskGetCurrentTaskHandle()) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     s_ctx.running = false;
 
@@ -709,15 +723,16 @@ esp_err_t ml_net_switch_stop(void)
     if (s_ctx.wifi_debounce_timer) xTimerStop(s_ctx.wifi_debounce_timer, portMAX_DELAY);
     s_ctx.wifi_disconnect_pending = false;
 
-    /* Wake task so it exits */
-    if (s_ctx.task_handle) {
-        xTaskNotifyGive(s_ctx.task_handle);
-        /* Wait for task to exit */
-        vTaskDelay(pdMS_TO_TICKS(500));
+    /* Wake the task and wait until it has left (it may be inside vpn_start). */
+    TaskHandle_t task = s_ctx.task_handle;
+    if (task) {
+        xTaskNotifyGive(task);
+        xEventGroupWaitBits(s_ctx.wifi_events, TASK_EXITED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
     }
 
-    /* Tear down connections */
-    vpn_stop();
+    /* Tear down connections; a refused destroy leaves the transport alone. */
+    esp_err_t err = vpn_stop();
+    if (err != ESP_OK) return err;
 
     if (s_ctx.active_transport == ML_NET_WIFI) {
         wifi_stop();

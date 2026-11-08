@@ -339,8 +339,9 @@ typedef struct {
     uint8_t node_count;
     bool avoid;             /* Avoid: never measured or chosen as home */
     bool no_measure;        /* NoMeasureNoHome: never measured or chosen as home */
-    bool derp_failed;       /* DERP connects kept failing: not a latency choice until
-                             * the next full round */
+    bool derp_failed;       /* DERP connects kept failing: not a latency choice until a
+                             * connection to it carries a frame, a rebind, a map without
+                             * it, or every region is excluded (ml_netcheck_end) */
 } ml_derp_region_t;
 
 /* DERP connect retry, tailscale v1.104.0: magicsock derp.go runDerpReader uses

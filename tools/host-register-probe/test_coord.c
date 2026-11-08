@@ -1109,7 +1109,8 @@ static void single_region_stall(bool priority) {
         CHECK(ml->derp_home_region == 901);
         CHECK(ml_derp_retry_due(&s, false, true, now + ML_DERP_BACKOFF_MAX_MS * 3 / 2));
     }
-    CHECK(ml->derp_regions[0].derp_failed);    /* latency choice only */
+    /* The only region excluded is every region excluded: forgotten, still retried. */
+    CHECK(!ml->derp_regions[0].derp_failed);
 
     /* Rebind: exclusions forgotten, registration lost, then a new connect request. */
     coord_state_t st = COORD_LONG_POLL;
@@ -1180,6 +1181,33 @@ static void test_offline_and_start(void) {
     ml_netcheck_forget_derp_failures(ml);
     CHECK(!ml->derp_regions[region_idx(ml, 901)].derp_failed && !ml->derp_failed_region &&
           !ml->derp_ok_region);
+    free(ml->netcheck.probes);
+    free(ml);
+}
+
+/* Latency mode: once every usable region is excluded, the exclusions are dropped and
+ * the measured latency decides again (not the first region of the map). */
+#define TWO_MAP "\"DERPMap\":{\"Regions\":{" \
+    "\"901\":{\"RegionID\":901,\"Nodes\":[{\"HostName\":\"d1a.example.invalid\",\"IPv4\":\"192.0.2.1\"}]}," \
+    "\"902\":{\"RegionID\":902,\"Nodes\":[{\"HostName\":\"d2.example.invalid\",\"IPv4\":\"198.51.100.1\"}]}}}"
+static void test_all_excluded_forgotten(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    CHECK(fetch_with(ml, "{" TWO_MAP ",\"Peers\":[]}") == 0);
+    int64_t t = 9900000000LL;
+    nc_round(ml, t, 0xC0000201u, 80000, 0xC6336401u, 20000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+    ml->derp_failed_region = 902;
+    t += 30000000;
+    nc_round(ml, t, 0xC0000201u, 80000, 0xC6336401u, 20000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 901);
+    CHECK(ml->derp_regions[region_idx(ml, 902)].derp_failed);
+    ml->derp_failed_region = 901;                       /* now 901 fails as well */
+    t += 30000000;
+    nc_round(ml, t, 0xC0000201u, 80000, 0xC6336401u, 20000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+    CHECK(!ml->derp_regions[region_idx(ml, 901)].derp_failed);
+    CHECK(!ml->derp_regions[region_idx(ml, 902)].derp_failed && ml->derp_failed_region == 0);
     free(ml->netcheck.probes);
     free(ml);
 }
@@ -1335,6 +1363,7 @@ int main(void) {
     test_single_region_stall();
     test_priority_region_unconditional();
     test_offline_and_start();
+    test_all_excluded_forgotten();
     test_dns_answers_and_library_task();
     test_stop_and_drain();
     test_rtt_from_receive_time();

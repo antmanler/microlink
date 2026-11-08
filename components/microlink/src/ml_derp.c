@@ -652,7 +652,7 @@ void ml_derp_tx_task(void *arg) {
 }
 
 /* ============================================================================
- * DERP Connection Management (called from coord task)
+ * DERP Connection Management (DERP I/O task)
  * ========================================================================== */
 
 /* TCP connect bounded by ML_DERP_DIAL_TIMEOUT_MS: a blocking lwIP connect ignores

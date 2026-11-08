@@ -537,6 +537,17 @@ bool ml_netcheck_end(microlink_t *ml, int64_t now_us) {
         if (ml->derp_ok_region == ok) ml->derp_ok_region = 0;
         mark_region(ml, ok, false);
     }
+    /* Every usable region excluded: the exclusions no longer tell regions apart, and
+     * keeping them would park the latency choice on the first region of the map. */
+    bool usable = false, excluded = false;
+    for (int i = 0; i < ml->derp_region_count; i++) {
+        if (ml_nc_region_can_home(&ml->derp_regions[i])) usable = true;
+        else if (ml->derp_regions[i].derp_failed) excluded = true;
+    }
+    if (!usable && excluded) {
+        ESP_LOGW(TAG, "Every region excluded: forgetting the exclusions");
+        ml_netcheck_forget_derp_failures(ml);
+    }
 
     /* The old choice still counts as reachable when its DERP connection carried a
      * frame recently (PreferredDERPFrameTime). */
