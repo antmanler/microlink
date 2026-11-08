@@ -633,37 +633,33 @@ void ml_derp_tx_task(void *arg) {
  * ========================================================================== */
 
 esp_err_t ml_derp_connect(microlink_t *ml) {
-    /* Determine DERP host/port from DERPMap with node failover.
-     * Always start from node 0 (the first/preferred node in the DERPMap).
-     * Only rotate to a different node after a SUCCESSFUL connection drops,
-     * NOT on connection failure (to avoid bouncing between nodes). */
-    const char *derp_host = ML_DERP_HOST;
+    /* Connect to the home region (measured by ml_netcheck.c), first DERP node of the
+     * region. Never a region absent from the DERP map: without one, no connection. */
+    char derp_host[sizeof(((ml_derp_node_t *)0)->hostname)] = "";   /* copy: coord may re-parse the map */
     int derp_port = ML_DERP_PORT;
+    uint16_t region = ml->derp_home_region;
 
-    if (ml->derp_region_count > 0 && ml->derp_home_region > 0) {
-        for (int i = 0; i < ml->derp_region_count; i++) {
-            if (ml->derp_regions[i].region_id == ml->derp_home_region) {
-                /* Always use the first non-stun-only node (preferred node).
-                 * This ensures we connect to the same node as most peers. */
-                for (int attempt = 0; attempt < ml->derp_regions[i].node_count; attempt++) {
-                    if (!ml->derp_regions[i].nodes[attempt].stun_only &&
-                        ml->derp_regions[i].nodes[attempt].hostname[0]) {
-                        derp_host = ml->derp_regions[i].nodes[attempt].hostname;
-                        if (ml->derp_regions[i].nodes[attempt].derp_port > 0) {
-                            derp_port = ml->derp_regions[i].nodes[attempt].derp_port;
-                        }
-                        break;
-                    }
-                }
+    for (int i = 0; region != 0 && i < ml->derp_region_count; i++) {
+        if (ml->derp_regions[i].region_id != region) continue;
+        for (int n = 0; n < ml->derp_regions[i].node_count; n++) {
+            const ml_derp_node_t *node = &ml->derp_regions[i].nodes[n];
+            if (!node->stun_only && node->hostname[0]) {
+                strncpy(derp_host, node->hostname, sizeof(derp_host) - 1);
+                if (node->derp_port > 0) derp_port = node->derp_port;
                 break;
             }
         }
+        break;
+    }
+    if (!derp_host[0]) {
+        ESP_LOGW(TAG, "No DERP node for home region %u (map has %d regions)",
+                 region, ml->derp_region_count);
+        return ESP_FAIL;
     }
 
     int64_t t_derp_start = esp_timer_get_time();
 
-    ESP_LOGI(TAG, "Connecting to DERP %s:%d (region %d)",
-             derp_host, derp_port, ml->derp_home_region ? ml->derp_home_region : ML_DERP_REGION);
+    ESP_LOGI(TAG, "Connecting to DERP %s:%d (region %u)", derp_host, derp_port, region);
 
     /* DNS resolve — accept IPv4 or IPv6 (carrier may be IPv6-only) */
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
@@ -996,6 +992,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         mbedtls_ssl_conf_read_timeout(&ml->derp.ssl_conf, 200);
     }
 
+    ml->derp.region = region;
     ml->derp.connected = true;
     ml->derp.last_recv_ms = ml_get_time_ms();
     xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECTED);

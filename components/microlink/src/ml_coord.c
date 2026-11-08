@@ -869,7 +869,7 @@ static int register_send(microlink_t *ml, ml_noise_state_t *noise, const reg_par
         .auth_key = auth_key,
         .followup = p->followup,
         .hostname = ml_device_name(ml),
-        .preferred_derp = ML_DERP_REGION,
+        .preferred_derp = ml->derp_home_region,     /* 0 until a DERP map is known */
         .challenge_response = chalresp,
     };
     char *json_str = ml_register_build_request(&req);
@@ -1319,6 +1319,82 @@ static void apply_self_node(microlink_t *ml, cJSON *node, bool read_expired) {
     if (read_expired) ml->key_expired = cJSON_IsTrue(cJSON_GetObjectItem(node, "Expired"));
 }
 
+/* Parse MapResponse.DERPMap (full netmap or delta) into ml->derp_regions, then let
+ * netcheck validate the home region and schedule a full measurement. */
+static void parse_derp_map(microlink_t *ml, cJSON *map_json) {
+    cJSON *derp_map = cJSON_GetObjectItem(map_json, "DERPMap");
+    if (derp_map) {
+        cJSON *regions = cJSON_GetObjectItem(derp_map, "Regions");
+        if (regions) {
+            ml->derp_region_count = 0;
+            cJSON *region_obj;
+            cJSON_ArrayForEach(region_obj, regions) {
+                if (ml->derp_region_count >= ML_MAX_DERP_REGIONS) break;
+                ml_derp_region_t *r = &ml->derp_regions[ml->derp_region_count];
+                memset(r, 0, sizeof(*r));
+
+                cJSON *rid = cJSON_GetObjectItem(region_obj, "RegionID");
+                if (rid) r->region_id = (uint16_t)rid->valuedouble;
+
+                cJSON *rcode = cJSON_GetObjectItem(region_obj, "RegionCode");
+                if (rcode && rcode->valuestring) {
+                    strncpy(r->code, rcode->valuestring, sizeof(r->code) - 1);
+                }
+
+                cJSON *avoid = cJSON_GetObjectItem(region_obj, "Avoid");
+                if (avoid && cJSON_IsTrue(avoid)) r->avoid = true;
+                r->no_measure = cJSON_IsTrue(cJSON_GetObjectItem(region_obj, "NoMeasureNoHome"));
+
+                /* Parse nodes */
+                cJSON *nodes = cJSON_GetObjectItem(region_obj, "Nodes");
+                if (nodes) {
+                    cJSON *node_obj;
+                    cJSON_ArrayForEach(node_obj, nodes) {
+                        if (r->node_count >= ML_MAX_DERP_NODES) break;
+                        ml_derp_node_t *n = &r->nodes[r->node_count];
+                        memset(n, 0, sizeof(*n));
+
+                        cJSON *hn = cJSON_GetObjectItem(node_obj, "HostName");
+                        if (hn && hn->valuestring) {
+                            strncpy(n->hostname, hn->valuestring, sizeof(n->hostname) - 1);
+                        }
+
+                        cJSON *ip4 = cJSON_GetObjectItem(node_obj, "IPv4");
+                        if (ip4 && ip4->valuestring) {
+                            strncpy(n->ipv4, ip4->valuestring, sizeof(n->ipv4) - 1);
+                        }
+
+                        cJSON *ip6 = cJSON_GetObjectItem(node_obj, "IPv6");
+                        if (ip6 && ip6->valuestring) {
+                            strncpy(n->ipv6, ip6->valuestring, sizeof(n->ipv6) - 1);
+                        }
+
+                        cJSON *sp = cJSON_GetObjectItem(node_obj, "STUNPort");
+                        if (cJSON_IsNumber(sp)) n->stun_port = sp->valueint;   /* -1: STUN off */
+
+                        cJSON *dp = cJSON_GetObjectItem(node_obj, "DERPPort");
+                        if (dp) n->derp_port = (uint16_t)dp->valuedouble;
+
+                        cJSON *so = cJSON_GetObjectItem(node_obj, "STUNOnly");
+                        if (so && cJSON_IsTrue(so)) n->stun_only = true;
+
+                        r->node_count++;
+                    }
+                }
+
+                ESP_LOGI(TAG, "  DERP region %d: %d nodes%s",
+                         r->region_id, r->node_count,
+                         (r->avoid || r->no_measure) ? " [not measured]" : "");
+
+                ml->derp_region_count++;
+            }
+            ESP_LOGI(TAG, "DERPMap: parsed %d regions", ml->derp_region_count);
+            ml_netcheck_on_derp_map(ml);
+        }
+    }
+
+}
+
 static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_map_start = esp_timer_get_time();
 
@@ -1358,7 +1434,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
      * to populate Node.HomeDERP for other peers. */
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_home_region);
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -1632,30 +1708,8 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
                     }
                 }
             }
-            /* Parse self-node DERP region — try modern HomeDERP (int) first,
-             * then fall back to legacy DERP string (format: "127.3.3.40:REGION") */
-            cJSON *home_derp = cJSON_GetObjectItem(node, "HomeDERP");
-            if (home_derp && cJSON_IsNumber(home_derp) && home_derp->valueint > 0) {
-                ml->derp_home_region = (uint16_t)home_derp->valueint;
-                ESP_LOGI(TAG, "Home DERP region: %d (from server, HomeDERP)", ml->derp_home_region);
-            } else {
-                cJSON *self_derp = cJSON_GetObjectItem(node, "DERP");
-                if (self_derp && self_derp->valuestring) {
-                    const char *colon = strrchr(self_derp->valuestring, ':');
-                    if (colon) {
-                        int region = atoi(colon + 1);
-                        if (region > 0) {
-                            ml->derp_home_region = (uint16_t)region;
-                            ESP_LOGI(TAG, "Home DERP region: %d (from server, legacy DERP)", region);
-                        }
-                    }
-                }
-            }
-            /* Fallback: if server didn't assign a DERP region, use our configured default */
-            if (ml->derp_home_region == 0) {
-                ml->derp_home_region = ML_DERP_REGION;
-                ESP_LOGI(TAG, "Home DERP region: %d (default)", ML_DERP_REGION);
-            }
+            /* The home DERP region is ours to measure (ml_netcheck.c); the server's
+             * HomeDERP only echoes the PreferredDERP we sent. */
 
             /* Parse KeyExpiry (ISO 8601: "YYYY-MM-DDTHH:MM:SSZ") */
             cJSON *key_expiry = cJSON_GetObjectItem(node, "KeyExpiry");
@@ -1704,75 +1758,8 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     /* Parse peers */
     parse_peers_from_map_response(ml, map_json);
 
-    /* Extract DERPMap if present — parse all regions and nodes */
-    cJSON *derp_map = cJSON_GetObjectItem(map_json, "DERPMap");
-    if (derp_map) {
-        cJSON *regions = cJSON_GetObjectItem(derp_map, "Regions");
-        if (regions) {
-            ml->derp_region_count = 0;
-            cJSON *region_obj;
-            cJSON_ArrayForEach(region_obj, regions) {
-                if (ml->derp_region_count >= ML_MAX_DERP_REGIONS) break;
-                ml_derp_region_t *r = &ml->derp_regions[ml->derp_region_count];
-                memset(r, 0, sizeof(*r));
-
-                cJSON *rid = cJSON_GetObjectItem(region_obj, "RegionID");
-                if (rid) r->region_id = (uint16_t)rid->valuedouble;
-
-                cJSON *rcode = cJSON_GetObjectItem(region_obj, "RegionCode");
-                if (rcode && rcode->valuestring) {
-                    strncpy(r->code, rcode->valuestring, sizeof(r->code) - 1);
-                }
-
-                cJSON *avoid = cJSON_GetObjectItem(region_obj, "Avoid");
-                if (avoid && cJSON_IsTrue(avoid)) r->avoid = true;
-
-                /* Parse nodes */
-                cJSON *nodes = cJSON_GetObjectItem(region_obj, "Nodes");
-                if (nodes) {
-                    cJSON *node_obj;
-                    cJSON_ArrayForEach(node_obj, nodes) {
-                        if (r->node_count >= ML_MAX_DERP_NODES) break;
-                        ml_derp_node_t *n = &r->nodes[r->node_count];
-                        memset(n, 0, sizeof(*n));
-
-                        cJSON *hn = cJSON_GetObjectItem(node_obj, "HostName");
-                        if (hn && hn->valuestring) {
-                            strncpy(n->hostname, hn->valuestring, sizeof(n->hostname) - 1);
-                        }
-
-                        cJSON *ip4 = cJSON_GetObjectItem(node_obj, "IPv4");
-                        if (ip4 && ip4->valuestring) {
-                            strncpy(n->ipv4, ip4->valuestring, sizeof(n->ipv4) - 1);
-                        }
-
-                        cJSON *ip6 = cJSON_GetObjectItem(node_obj, "IPv6");
-                        if (ip6 && ip6->valuestring) {
-                            strncpy(n->ipv6, ip6->valuestring, sizeof(n->ipv6) - 1);
-                        }
-
-                        cJSON *sp = cJSON_GetObjectItem(node_obj, "STUNPort");
-                        if (sp) n->stun_port = (uint16_t)sp->valuedouble;
-
-                        cJSON *dp = cJSON_GetObjectItem(node_obj, "DERPPort");
-                        if (dp) n->derp_port = (uint16_t)dp->valuedouble;
-
-                        cJSON *so = cJSON_GetObjectItem(node_obj, "STUNOnly");
-                        if (so && cJSON_IsTrue(so)) n->stun_only = true;
-
-                        r->node_count++;
-                    }
-                }
-
-                ESP_LOGI(TAG, "  DERP region %d: %d nodes%s",
-                         r->region_id, r->node_count,
-                         r->avoid ? " [avoid]" : "");
-
-                ml->derp_region_count++;
-            }
-            ESP_LOGI(TAG, "DERPMap: parsed %d regions", ml->derp_region_count);
-        }
-    }
+    /* DERP map: the home region is checked against it and measured again. */
+    parse_derp_map(ml, map_json);
 
     cJSON_Delete(map_json);
     free(resp_buf);
@@ -1823,7 +1810,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
      * to populate Node.HomeDERP for other peers. */
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_home_region);
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -1885,8 +1872,8 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
  *
  * Uses H2 stream 7. Response body is discarded (only HTTP status matters).
  * Returns 0 on success, -1 on send failure. */
-static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
-    if (ml->stun_public_ip == 0 && !ml->stun_has_ipv6) {
+static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise, bool netinfo_changed) {
+    if (ml->stun_public_ip == 0 && !ml->stun_has_ipv6 && !netinfo_changed) {
         ESP_LOGD(TAG, "No STUN endpoints yet, skipping endpoint update");
         return 0;  /* Nothing to send */
     }
@@ -1924,7 +1911,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 
         cJSON *netinfo = cJSON_CreateObject();
         if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_home_region);
             if (ml->stun_nat_checked) {
                 cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
             }
@@ -2125,6 +2112,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise, bool *map_u
 
         /* Parse peer updates */
         parse_peers_from_map_response(ml, update_json);
+        parse_derp_map(ml, update_json);
         cJSON_Delete(update_json);
     }
 
@@ -2234,6 +2222,119 @@ static void coord_handle_key_expired(microlink_t *ml, ml_noise_state_t *noise, c
     }
     memset(new_priv, 0, sizeof(new_priv));
     coord_fail(ml, noise, state, ML_ERR_KEY_ROTATED);
+}
+
+/* One STUN reply from stun_rx_queue (the caller frees pkt->data). A netcheck latency
+ * probe reply is taken by ml_netcheck_on_stun(); anything else is endpoint discovery,
+ * and with send_update a new endpoint goes to the control plane at once. */
+static void coord_handle_stun_packet(microlink_t *ml, ml_noise_state_t *noise,
+                                     const ml_rx_packet_t *pkt, bool send_update) {
+    if (ml_netcheck_on_stun(ml, pkt->data, pkt->len, esp_timer_get_time())) return;
+
+    uint32_t pub_ip;
+    uint16_t pub_port;
+    bool parsed = false;
+
+    /* Try IPv4 parse first */
+    if (ml_stun_parse_response(pkt->data, pkt->len,
+                                &pub_ip, &pub_port)) {
+        if (ml->stun_public_ip == 0) {
+            /* First STUN result (primary server) */
+            ml->stun_public_ip = pub_ip;
+            ml->stun_public_port = pub_port;
+            ml->stun_retry_count = 0;
+            /* Send probe to fallback for symmetric NAT check */
+            if (!ml->stun_nat_checked && ml->stun_fallback_ip) {
+                ml_stun_send_probe_to(ml, ml->stun_fallback_ip,
+                                       ML_STUN_FALLBACK_PORT);
+                ESP_LOGI(TAG, "Sent STUN to fallback for NAT type detection");
+            }
+        } else if (!ml->stun_nat_checked) {
+            /* Second STUN result (fallback) — compare ports */
+            ml->stun_secondary_port = pub_port;
+            ml->stun_nat_checked = true;
+            if (ml->stun_public_port != pub_port) {
+                ml->nat_mapping_varies = true;
+                ESP_LOGW(TAG, "Symmetric NAT detected "
+                         "(direct connections unlikely)");
+            } else {
+                ml->nat_mapping_varies = false;
+                ESP_LOGI(TAG, "Cone NAT: port consistent "
+                         "(direct connections possible)");
+            }
+        } else {
+            /* Periodic re-probe — update primary result */
+            ml->stun_public_ip = pub_ip;
+            ml->stun_public_port = pub_port;
+            ml->stun_retry_count = 0;
+        }
+        parsed = true;
+    }
+
+    /* Try IPv6 parse (response may contain IPv6 XOR-MAPPED-ADDRESS) */
+    if (!parsed) {
+        uint8_t ip6[16];
+        uint16_t port6;
+        if (ml_stun_parse_response_ipv6(pkt->data, pkt->len,
+                                         ip6, &port6)) {
+            memcpy(ml->stun_public_ip6, ip6, 16);
+            ml->stun_public_port6 = port6;
+            ml->stun_has_ipv6 = true;
+            /* Use IPv6 port for NAT detection if no IPv4 result yet */
+            if (ml->stun_public_port == 0) {
+                ml->stun_public_port = port6;
+            }
+            ml->stun_retry_count = 0;  /* Got a result, stop retrying */
+            ESP_LOGI(TAG, "STUN IPv6 result obtained");
+            /* Trigger NAT type check if not done yet */
+            if (!ml->stun_nat_checked && ml->stun_fallback_ip) {
+                ml_stun_send_probe_to(ml, ml->stun_fallback_ip,
+                                       ML_STUN_FALLBACK_PORT);
+                ESP_LOGI(TAG, "Sent STUN to fallback for NAT type detection");
+            }
+            parsed = true;
+        }
+    }
+
+    if (parsed) {
+        xEventGroupSetBits(ml->events, ML_EVT_STUN_COMPLETE);
+        /* Send endpoint update to control plane immediately.
+         * With Version >= 68, Stream=true MapRequests have endpoints
+         * IGNORED, so we need this separate Stream=false request. */
+        if (send_update) do_send_endpoint_update(ml, noise, false);
+    }
+}
+
+/* The home region changed: the DERP connection follows it, and with the long-poll
+ * open the control plane hears the new PreferredDERP at once. */
+static void coord_home_changed(microlink_t *ml, ml_noise_state_t *noise, bool long_poll_open) {
+    ESP_LOGI(TAG, "Home DERP region: %u", ml->derp_home_region);
+    if (ml->derp.connected && ml->derp.region != ml->derp_home_region) {
+        xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+    }
+    if (long_poll_open) do_send_endpoint_update(ml, noise, true);
+}
+
+/* One netcheck round (DERP region latency). Blocks until every planned region replied
+ * or ML_NC_STUN_TIMEOUT_MS passed; other STUN replies meanwhile get their usual
+ * handling. Returns true when the home region changed. */
+static bool coord_run_netcheck(microlink_t *ml, ml_noise_state_t *noise, bool long_poll_open) {
+    if (ml_netcheck_begin(ml, esp_timer_get_time())) {
+        for (;;) {
+            int32_t wait_ms = ml_netcheck_service(ml, esp_timer_get_time());
+            if (wait_ms < 0) break;
+            TickType_t ticks = pdMS_TO_TICKS(wait_ms);
+            if (ticks == 0) ticks = 1;      /* the shortest wait that still blocks */
+            ml_rx_packet_t pkt;
+            if (xQueueReceive(ml->stun_rx_queue, &pkt, ticks) == pdTRUE) {
+                coord_handle_stun_packet(ml, noise, &pkt, long_poll_open);
+                free(pkt.data);
+            }
+        }
+    }
+    if (!ml_netcheck_end(ml, esp_timer_get_time())) return false;
+    coord_home_changed(ml, noise, long_poll_open);
+    return true;
 }
 
 /* Apply one command from the app. FORCE_RECONNECT (microlink_rebind, DERP failure) never
@@ -2619,6 +2720,12 @@ void ml_coord_task(void *arg) {
 
             xEventGroupSetBits(ml->events, ML_EVT_COORD_REGISTERED);
 
+            /* Pick the home region before DERP connects to it (the DERP map just
+             * arrived, so a full round is due). */
+            if (ml_netcheck_due(ml, ml_get_time_ms())) {
+                coord_run_netcheck(ml, &noise, false);
+            }
+
             /* Signal DERP I/O task to connect (connection now owned by I/O task) */
             if (!ml->derp.connected) {
                 xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
@@ -2636,7 +2743,7 @@ void ml_coord_task(void *arg) {
             /* Send initial endpoint update if STUN already completed.
              * (STUN runs concurrently and may have results by now.) */
             if (ml->stun_public_ip != 0 || ml->stun_has_ipv6) {
-                do_send_endpoint_update(ml, &noise);
+                do_send_endpoint_update(ml, &noise, false);
             }
 
             /* Send initial HTTP/2 PING immediately to keep connection active
@@ -2675,82 +2782,19 @@ void ml_coord_task(void *arg) {
                     break;
                 }
 
-                /* Check for STUN response in queue (IPv4 or IPv6) */
-                ml_rx_packet_t stun_pkt;
-                if (xQueueReceive(ml->stun_rx_queue, &stun_pkt, 0) == pdTRUE) {
-                    uint32_t pub_ip;
-                    uint16_t pub_port;
-                    bool parsed = false;
-
-                    /* Try IPv4 parse first */
-                    if (ml_stun_parse_response(stun_pkt.data, stun_pkt.len,
-                                                &pub_ip, &pub_port)) {
-                        if (ml->stun_public_ip == 0) {
-                            /* First STUN result (primary server) */
-                            ml->stun_public_ip = pub_ip;
-                            ml->stun_public_port = pub_port;
-                            ml->stun_retry_count = 0;
-                            /* Send probe to fallback for symmetric NAT check */
-                            if (!ml->stun_nat_checked && ml->stun_fallback_ip) {
-                                ml_stun_send_probe_to(ml, ml->stun_fallback_ip,
-                                                       ML_STUN_FALLBACK_PORT);
-                                ESP_LOGI(TAG, "Sent STUN to fallback for NAT type detection");
-                            }
-                        } else if (!ml->stun_nat_checked) {
-                            /* Second STUN result (fallback) — compare ports */
-                            ml->stun_secondary_port = pub_port;
-                            ml->stun_nat_checked = true;
-                            if (ml->stun_public_port != pub_port) {
-                                ml->nat_mapping_varies = true;
-                                ESP_LOGW(TAG, "Symmetric NAT detected "
-                                         "(direct connections unlikely)");
-                            } else {
-                                ml->nat_mapping_varies = false;
-                                ESP_LOGI(TAG, "Cone NAT: port consistent "
-                                         "(direct connections possible)");
-                            }
-                        } else {
-                            /* Periodic re-probe — update primary result */
-                            ml->stun_public_ip = pub_ip;
-                            ml->stun_public_port = pub_port;
-                            ml->stun_retry_count = 0;
-                        }
-                        parsed = true;
+                /* STUN replies: latency probes first, then endpoint discovery. */
+                {
+                    ml_rx_packet_t stun_pkt;
+                    while (xQueueReceive(ml->stun_rx_queue, &stun_pkt, 0) == pdTRUE) {
+                        coord_handle_stun_packet(ml, &noise, &stun_pkt, true);
+                        free(stun_pkt.data);
                     }
+                }
 
-                    /* Try IPv6 parse (response may contain IPv6 XOR-MAPPED-ADDRESS) */
-                    if (!parsed) {
-                        uint8_t ip6[16];
-                        uint16_t port6;
-                        if (ml_stun_parse_response_ipv6(stun_pkt.data, stun_pkt.len,
-                                                         ip6, &port6)) {
-                            memcpy(ml->stun_public_ip6, ip6, 16);
-                            ml->stun_public_port6 = port6;
-                            ml->stun_has_ipv6 = true;
-                            /* Use IPv6 port for NAT detection if no IPv4 result yet */
-                            if (ml->stun_public_port == 0) {
-                                ml->stun_public_port = port6;
-                            }
-                            ml->stun_retry_count = 0;  /* Got a result, stop retrying */
-                            ESP_LOGI(TAG, "STUN IPv6 result obtained");
-                            /* Trigger NAT type check if not done yet */
-                            if (!ml->stun_nat_checked && ml->stun_fallback_ip) {
-                                ml_stun_send_probe_to(ml, ml->stun_fallback_ip,
-                                                       ML_STUN_FALLBACK_PORT);
-                                ESP_LOGI(TAG, "Sent STUN to fallback for NAT type detection");
-                            }
-                            parsed = true;
-                        }
-                    }
-
-                    if (parsed) {
-                        xEventGroupSetBits(ml->events, ML_EVT_STUN_COMPLETE);
-                        /* Send endpoint update to control plane immediately.
-                         * With Version >= 68, Stream=true MapRequests have endpoints
-                         * IGNORED, so we need this separate Stream=false request. */
-                        do_send_endpoint_update(ml, &noise);
-                    }
-                    free(stun_pkt.data);
+                /* DERP region latency (netcheck): after a DERP map, a rebind, and
+                 * every STUN re-probe interval. Blocks at most ML_NC_STUN_TIMEOUT_MS. */
+                if (ml_netcheck_due(ml, now)) {
+                    coord_run_netcheck(ml, &noise, true);
                 }
 
                 /* STUN retry logic: 3 attempts per server, 2s apart, then fallback */

@@ -153,8 +153,8 @@ esp_err_t ml_stun_resolve_servers(microlink_t *ml) {
     uint16_t primary_port = ML_STUN_PRIMARY_PORT;
 
     if (ml->derp_region_count > 0) {
-        /* Find home region (derp_home_region) or fallback to first region */
-        uint16_t target_region = ml->derp_home_region ? ml->derp_home_region : ML_DERP_REGION;
+        /* STUN server for endpoint discovery: a node of the home region if known */
+        uint16_t target_region = ml->derp_home_region;
         for (int i = 0; i < ml->derp_region_count; i++) {
             if (ml->derp_regions[i].region_id == target_region &&
                 ml->derp_regions[i].node_count > 0 &&
@@ -347,6 +347,31 @@ esp_err_t ml_stun_send_probe_to(microlink_t *ml, uint32_t server_ip, uint16_t po
     microlink_ip_to_str(server_ip, ip_str);
     ESP_LOGI(TAG, "STUN probe sent to %s:%u (%d bytes)", ip_str, port, (int)req_len);
     return ESP_OK;
+}
+
+/* ============================================================================
+ * Send a binding request with its own transaction ID (DERP latency probes,
+ * ml_netcheck.c). The endpoint-discovery txid above is left untouched.
+ * ========================================================================== */
+
+esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t server_ip, uint16_t port,
+                                uint8_t txid_out[12]) {
+    if (server_ip == 0) return ESP_ERR_INVALID_ARG;
+    /* Same socket choice as ml_stun_send_probe_to: replies reach stun_rx_queue. */
+    int sock = ml->disco_sock4;
+    if (sock < 0) {
+        if (ensure_stun_socket(ml) != ESP_OK) return ESP_FAIL;
+        sock = ml->stun_sock;
+    }
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = htonl(server_ip),
+    };
+    uint8_t request[STUN_REQUEST_SIZE];
+    size_t req_len = build_stun_request(request, txid_out);
+    int n = ml_sendto(sock, request, req_len, 0, (struct sockaddr *)&dest, sizeof(dest));
+    return n < 0 ? ESP_FAIL : ESP_OK;
 }
 
 /* ============================================================================

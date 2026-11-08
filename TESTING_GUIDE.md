@@ -130,7 +130,7 @@ nc -u <ESP32_VPN_IP> 9000
 SIM ready, IMEI: XXXXXXXXXXX
 Registered on network: <carrier>
 PPP connected — using lwIP standard sockets
-DERP connect: derp9e.tailscale.com
+Connecting to DERP <home region node> (region <id>)
 VPN connected: 100.x.x.x
 ```
 

@@ -81,10 +81,9 @@ extern "C" {
 #define ML_MAX_PACKET_SIZE      1500
 #define ML_DERP_MAX_FRAME       (ML_MAX_PACKET_SIZE + 64)
 
-/* DERP */
-#define ML_DERP_REGION          9       /* Dallas (dfw) */
-#define ML_DERP_HOST            "derp9e.tailscale.com"
-#define ML_DERP_PORT            443
+/* DERP. The home region is measured (ml_netcheck.c), never a constant. */
+#define ML_DERP_PORT            443     /* tailcfg.DERPNode.DERPPort: zero means 443 */
+#define ML_STUN_DEFAULT_PORT    3478    /* tailcfg.DERPNode.STUNPort: zero means 3478 */
 
 /* Tailscale control plane */
 #define ML_CTRL_HOST            "controlplane.tailscale.com"
@@ -304,9 +303,10 @@ typedef struct {
     char hostname[64];
     char ipv4[16];
     char ipv6[46];
-    uint16_t stun_port;     /* 0 = default 3478 */
+    int32_t stun_port;      /* 0 = default 3478, negative = STUN disabled (tailcfg) */
     uint16_t derp_port;     /* 0 = default 443 */
     bool stun_only;         /* true if node only serves STUN, not DERP */
+    uint32_t stun_ipv4;     /* IPv4 for latency probes, host order; 0 = not resolved */
 } ml_derp_node_t;
 
 typedef struct {
@@ -314,8 +314,62 @@ typedef struct {
     char code[8];           /* e.g. "dfw", "nyc", "sfo" */
     ml_derp_node_t nodes[ML_MAX_DERP_NODES];
     uint8_t node_count;
-    bool avoid;             /* true if region should be avoided */
+    bool avoid;             /* Avoid: never measured or chosen as home */
+    bool no_measure;        /* NoMeasureNoHome: never measured or chosen as home */
 } ml_derp_region_t;
+
+/* ============================================================================
+ * DERP home region by measured latency (ml_netcheck.c, owned by coord task)
+ *
+ * A port of tailscaled's netcheck (tailscale.com v1.104.0 net/netcheck/netcheck.go):
+ * STUN probes to every region's nodes, the lowest latency region becomes home,
+ * with tailscaled's stickiness. Constants carry their source names.
+ * ========================================================================== */
+
+#define ML_NC_STUN_TIMEOUT_MS       3000    /* stunProbeTimeout */
+#define ML_NC_INITIAL_RETRANSMIT_MS 100     /* defaultInitialRetransmitTime */
+#define ML_NC_ACTIVE_RETRANSMIT_MS  200     /* defaultActiveRetransmitTime */
+#define ML_NC_INITIAL_TRIES         3       /* makeProbePlanInitial: for try := range 3 */
+#define ML_NC_INCREMENTAL_REGIONS   3       /* numIncrementalRegions */
+#define ML_NC_FASTEST_REGIONS       2       /* makeProbePlan: isFastestTwo := ri < 2 */
+#define ML_NC_FASTEST_TRIES         2       /* makeProbePlan: tries = 2 for the fastest two */
+#define ML_NC_HOME_TRIES            4       /* makeProbePlan: tries = 4 for the home region */
+#define ML_NC_RETRANSMIT_PCT        120     /* makeProbePlan: last.RegionLatency*120/100 */
+#define ML_NC_RETRANSMIT_STEP_MS    50      /* makeProbePlan: delay += try*50ms when try > 1 */
+#define ML_NC_FULL_INTERVAL_MS      (5 * 60 * 1000)   /* fullReportInterval */
+#define ML_NC_ABS_DIFF_US           10000   /* preferredDERPAbsoluteDiff (10 ms) */
+#define ML_NC_KEEP_NUM              2       /* keep old home if bestAny > old/3*2 */
+#define ML_NC_KEEP_DEN              3
+#define ML_NC_FRAME_TIME_MS         8000    /* PreferredDERPFrameTime */
+/* The initial plan is the largest (an incremental one has at most 2+2+1+4 probes). */
+#define ML_NC_MAX_PROBES            (ML_MAX_DERP_REGIONS * ML_NC_INITIAL_TRIES)
+
+typedef struct {
+    uint8_t txid[12];
+    uint8_t region;         /* index into derp_regions */
+    uint8_t node;           /* index into that region's nodes */
+    bool sent;
+    uint32_t delay_us;      /* after round start */
+    int64_t sent_us;
+} ml_nc_probe_t;
+
+typedef struct {
+    uint16_t region_id;
+    uint32_t latency_us;
+} ml_nc_sample_t;
+
+typedef struct {
+    ml_nc_probe_t *probes;                  /* PSRAM, only while a round runs */
+    int probe_count;
+    int64_t start_us;
+    uint32_t lat_us[ML_MAX_DERP_REGIONS];   /* this round, by derp_regions index; 0 = no reply */
+    ml_nc_sample_t last[ML_MAX_DERP_REGIONS];   /* last report: regions that replied */
+    int last_count;
+    uint64_t last_round_ms;                 /* start of the last round */
+    uint64_t last_full_ms;
+    bool ran;                               /* a round has run since start */
+    bool next_full;
+} ml_netcheck_t;
 
 /* ============================================================================
  * Noise Protocol State (owned exclusively by coord task)
@@ -347,6 +401,7 @@ typedef struct {
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
     bool connected;
+    uint16_t region;                /* region of the current connection */
     uint64_t last_recv_ms;          /* For keepalive watchdog */
 } ml_derp_conn_t;
 
@@ -434,7 +489,8 @@ struct microlink_s {
     /* DERP map (parsed from MapResponse, owned by coord task) */
     ml_derp_region_t derp_regions[ML_MAX_DERP_REGIONS];
     uint8_t derp_region_count;
-    uint16_t derp_home_region;      /* Our PreferredDERP region */
+    uint16_t derp_home_region;      /* Our PreferredDERP region; 0 until a DERP map is known */
+    ml_netcheck_t netcheck;         /* region latency measurement */
 
     /* Key expiry (parsed from MapResponse self-node) */
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
@@ -520,6 +576,27 @@ bool ml_stun_parse_response(const uint8_t *data, size_t len,
                              uint32_t *out_ip, uint16_t *out_port);
 bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
                                   uint8_t *out_ip6, uint16_t *out_port);
+
+esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t server_ip, uint16_t port,
+                                uint8_t txid_out[12]);
+
+/* ml_netcheck.c: pure parts (no I/O) */
+bool ml_nc_node_can_stun(const ml_derp_node_t *n);
+bool ml_nc_region_can_home(const ml_derp_region_t *r);
+int ml_nc_make_plan(const ml_derp_region_t *regions, int count,
+                    const ml_nc_sample_t *last, int last_count, uint16_t home,
+                    ml_nc_probe_t *out, int max);
+uint16_t ml_nc_fallback_home(const ml_derp_region_t *regions, int count, uint16_t prev);
+uint16_t ml_nc_pick_home(const ml_derp_region_t *regions, int count, const uint32_t *lat_us,
+                         uint16_t prev, bool prev_heard_recently);
+/* ml_netcheck.c: one measurement round, driven by the coord task */
+bool ml_netcheck_on_derp_map(microlink_t *ml);
+void ml_netcheck_request_full(microlink_t *ml);
+bool ml_netcheck_due(const microlink_t *ml, uint64_t now_ms);
+bool ml_netcheck_begin(microlink_t *ml, int64_t now_us);
+int32_t ml_netcheck_service(microlink_t *ml, int64_t now_us);
+bool ml_netcheck_on_stun(microlink_t *ml, const uint8_t *data, size_t len, int64_t now_us);
+bool ml_netcheck_end(microlink_t *ml, int64_t now_us);
 
 /* ml_noise.c */
 void ml_noise_init(ml_noise_state_t *state,

@@ -54,7 +54,7 @@ Health check: periodic timer checks `microlink_is_connected()`. After 3 consecut
 7. **DERP reconnect handler**: Auto-reconnect on write failure
 8. **Read timeout**: 200ms after DERP handshake (was 10s from connect phase)
 9. **32 DERP regions**: Raised from 16 (Tailscale now serves 28 regions)
-10. **DERP host fallback**: derp9e.tailscale.com
+10. **DERP home region**: measured by STUN latency to the DERP map regions (ml_netcheck.c, after tailscaled netcheck); never a region absent from the map
 
 ## Memory Layout
 

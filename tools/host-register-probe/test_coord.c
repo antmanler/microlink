@@ -447,7 +447,178 @@ static void test_fetch_self_node(void) {
     free(ml);
 }
 
+/* ---- A: DERP home region by measured latency (ml_netcheck.c) -------------- */
+
+extern int stub_binding_sent;
+extern uint32_t stub_binding_ip[256];
+extern uint8_t stub_binding_txid[256][12];
+
+/* Regions 901, 902, 904 only (no region 9). 904 is Avoid, 905 NoMeasureNoHome, 906 has
+ * STUN disabled. Addresses are documentation ranges, host names placeholders. */
+#define NC_MAP                                                                              \
+    "\"DERPMap\":{\"Regions\":{"                                                             \
+    "\"901\":{\"RegionID\":901,\"RegionCode\":\"r1\",\"Nodes\":["                           \
+    "{\"HostName\":\"d1a.example.invalid\",\"IPv4\":\"192.0.2.1\"},"                        \
+    "{\"HostName\":\"d1b.example.invalid\",\"IPv4\":\"192.0.2.2\",\"STUNPort\":3479}]},"    \
+    "\"902\":{\"RegionID\":902,\"RegionCode\":\"r2\",\"Nodes\":["                           \
+    "{\"HostName\":\"d2.example.invalid\",\"IPv4\":\"198.51.100.1\"}]},"                    \
+    "\"904\":{\"RegionID\":904,\"RegionCode\":\"r4\",\"Avoid\":true,\"Nodes\":["            \
+    "{\"HostName\":\"d4.example.invalid\",\"IPv4\":\"203.0.113.1\"}]},"                     \
+    "\"905\":{\"RegionID\":905,\"RegionCode\":\"r5\",\"NoMeasureNoHome\":true,\"Nodes\":[" \
+    "{\"HostName\":\"d5.example.invalid\",\"IPv4\":\"203.0.113.2\"}]},"                     \
+    "\"906\":{\"RegionID\":906,\"RegionCode\":\"r6\",\"Nodes\":["                           \
+    "{\"HostName\":\"d6.example.invalid\",\"IPv4\":\"203.0.113.3\",\"STUNPort\":-1}]}}}"
+
+static int region_idx(microlink_t *ml, uint16_t id) {
+    for (int i = 0; i < ml->derp_region_count; i++)
+        if (ml->derp_regions[i].region_id == id) return i;
+    return -1;
+}
+
+/* Answer the probe sent to `ip` (the first one, or the try-th) after rtt_us. */
+static bool nc_reply(microlink_t *ml, int first_probe, uint32_t ip, int64_t sent_us, int64_t rtt_us) {
+    for (int i = first_probe; i < stub_binding_sent; i++) {
+        if (stub_binding_ip[i] != ip) continue;
+        uint8_t r[20] = {0x01, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42};
+        memcpy(r + 8, stub_binding_txid[i], 12);
+        (void)sent_us;
+        return ml_netcheck_on_stun(ml, r, sizeof(r), sent_us + rtt_us);
+    }
+    return false;
+}
+
+/* Run one round: begin at t0, send the first wave, answer given regions. */
+static void nc_round(microlink_t *ml, int64_t t0, uint32_t ip_a, int64_t rtt_a,
+                     uint32_t ip_b, int64_t rtt_b) {
+    int first = stub_binding_sent;
+    CHECK(ml_netcheck_begin(ml, t0));
+    CHECK(ml_netcheck_service(ml, t0) >= 0);
+    if (ip_a) CHECK(nc_reply(ml, first, ip_a, t0, rtt_a));
+    if (ip_b) CHECK(nc_reply(ml, first, ip_b, t0, rtt_b));
+}
+
+static void test_netcheck_plan(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":[]}") == 0);
+    CHECK(ml->derp_region_count == 5);
+    int i904 = region_idx(ml, 904), i905 = region_idx(ml, 905), i906 = region_idx(ml, 906);
+    CHECK(ml->derp_regions[i904].avoid && ml->derp_regions[i905].no_measure);
+    CHECK(ml->derp_regions[i906].nodes[0].stun_port == -1);
+
+    /* No region 9 in the map: the home region is the first one, never 9. */
+    CHECK(ml->derp_home_region == 901);
+    CHECK(ml_netcheck_due(ml, 1000));
+
+    /* Initial plan: 901 and 902 only, three tries 100 ms apart, nodes in turn. */
+    for (int r = 0; r < ml->derp_region_count; r++)
+        for (int n = 0; n < ml->derp_regions[r].node_count; n++) {
+            ml_derp_node_t *nd = &ml->derp_regions[r].nodes[n];
+            unsigned a, b, c, d;
+            if (sscanf(nd->ipv4, "%u.%u.%u.%u", &a, &b, &c, &d) == 4)
+                nd->stun_ipv4 = (a << 24) | (b << 16) | (c << 8) | d;
+        }
+    ml_nc_probe_t plan[ML_NC_MAX_PROBES];
+    int n = ml_nc_make_plan(ml->derp_regions, ml->derp_region_count, NULL, 0, 901, plan, ML_NC_MAX_PROBES);
+    CHECK(n == 6);
+    int i901 = region_idx(ml, 901), i902 = region_idx(ml, 902);
+    CHECK(plan[0].region == i901 && plan[0].node == 0 && plan[0].delay_us == 0);
+    CHECK(plan[1].region == i901 && plan[1].node == 1 && plan[1].delay_us == 100000);
+    CHECK(plan[2].region == i901 && plan[2].node == 0 && plan[2].delay_us == 200000);
+    CHECK(plan[3].region == i902 && plan[5].delay_us == 200000);
+
+    /* Incremental plan: fastest first; home gets four tries spaced by its latency. */
+    ml_nc_sample_t last[2] = {{902, 20000}, {901, 50000}};
+    n = ml_nc_make_plan(ml->derp_regions, ml->derp_region_count, last, 2, 901, plan, ML_NC_MAX_PROBES);
+    CHECK(n == 2 + 4);
+    CHECK(plan[0].region == i902 && plan[1].delay_us == 24000);                 /* 20 ms * 1.2 */
+    CHECK(plan[2].region == i901 && plan[3].delay_us == 60000);
+    CHECK(plan[4].delay_us == 2 * 60000 + 2 * 50000 && plan[5].delay_us == 3 * 60000 + 3 * 50000);
+    free(ml);
+}
+
+static void test_netcheck_choice(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":[]}") == 0);
+    const uint32_t ip901 = 0xC0000201u, ip902 = 0xC6336401u;   /* 192.0.2.1, 198.51.100.1 */
+    int64_t t = 1000000000;
+
+    /* 902 at 20 ms against 901 at 80 ms: home moves to 902. Avoid / NoMeasure / no-STUN
+     * regions are never probed. */
+    int first = stub_binding_sent;
+    nc_round(ml, t, ip901, 80000, ip902, 20000);
+    for (int i = first; i < stub_binding_sent; i++)
+        CHECK(stub_binding_ip[i] == ip901 || stub_binding_ip[i] == ip902);
+    CHECK(ml_netcheck_service(ml, t + 1000) == -1);         /* every region replied */
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+    CHECK(ml->netcheck.last_count == 2 && ml->netcheck.probes == NULL);
+    CHECK(!ml_netcheck_due(ml, (uint64_t)(t / 1000) + 1000));
+    CHECK(ml_netcheck_due(ml, (uint64_t)(t / 1000) + 23000));
+
+    /* Hysteresis: 901 at 15 ms is under 2/3 of 902's 24 ms but only 9 ms better
+     * (under 10 ms): stay. */
+    t += 30000000;
+    nc_round(ml, t, ip901, 15000, ip902, 24000);
+    CHECK(!ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+
+    /* 901 at 70 ms vs 902 at 100 ms: 30 ms better but not under 2/3 of 100 ms: stay. */
+    t += 30000000;
+    nc_round(ml, t, ip901, 70000, ip902, 100000);
+    CHECK(!ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+
+    /* 901 at 60 ms vs 902 at 100 ms: clearly better: move. */
+    t += 30000000;
+    nc_round(ml, t, ip901, 60000, ip902, 100000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 901);
+
+    /* No region answers: the round times out and the previous home stays. */
+    t += 30000000;
+    nc_round(ml, t, 0, 0, 0, 0);
+    CHECK(ml_netcheck_service(ml, t + 100000) > 0);         /* still waiting, next try due */
+    CHECK(ml_netcheck_service(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL) == -1);
+    CHECK(!ml_netcheck_end(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL) && ml->derp_home_region == 901);
+    CHECK(ml->netcheck.last_count == 0);
+
+    /* A reply nobody asked for is not a latency sample. */
+    uint8_t stray[20] = {0x01, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42};
+    CHECK(ml_netcheck_begin(ml, t));
+    CHECK(!ml_netcheck_on_stun(ml, stray, sizeof(stray), t + 1000));
+    ml_netcheck_end(ml, t + 1000);
+    free(ml);
+
+    /* No previous home and no reply: the first region of the map that can be home. */
+    ml = new_ml(false);
+    CHECK(fetch_with(ml, "{\"DERPMap\":{\"Regions\":{"
+                         "\"904\":{\"RegionID\":904,\"Avoid\":true,\"Nodes\":[{\"HostName\":\"a.example.invalid\",\"IPv4\":\"203.0.113.1\"}]},"
+                         "\"907\":{\"RegionID\":907,\"Nodes\":[{\"HostName\":\"b.example.invalid\",\"IPv4\":\"203.0.113.7\"}]}}},"
+                         "\"Peers\":[]}") == 0);
+    CHECK(ml->derp_home_region == 907);
+    t = 2000000000;
+    nc_round(ml, t, 0, 0, 0, 0);
+    CHECK(!ml_netcheck_end(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL) && ml->derp_home_region == 907);
+    free(ml);
+
+    /* Pure choice: an Avoid region never wins even when fastest; a silent old home
+     * still heard on DERP is kept. */
+    ml_derp_region_t regs[3];
+    memset(regs, 0, sizeof(regs));
+    regs[0].region_id = 901; regs[0].node_count = 1; strcpy(regs[0].nodes[0].hostname, "x");
+    regs[1].region_id = 902; regs[1].node_count = 1; strcpy(regs[1].nodes[0].hostname, "y");
+    regs[2].region_id = 904; regs[2].node_count = 1; strcpy(regs[2].nodes[0].hostname, "z");
+    regs[2].avoid = true;
+    uint32_t lat[3] = {50000, 0, 1000};
+    CHECK(ml_nc_pick_home(regs, 3, lat, 0, false) == 901);
+    CHECK(ml_nc_pick_home(regs, 3, lat, 902, true) == 902);
+    CHECK(ml_nc_pick_home(regs, 3, lat, 902, false) == 901);
+    CHECK(ml_nc_pick_home(regs, 3, lat, 9, false) == 901);   /* 9 is not in the map */
+    uint32_t none[3] = {0, 0, 0};
+    CHECK(ml_nc_pick_home(regs, 3, none, 9, false) == 901);
+}
+
 int main(void) {
+    test_netcheck_plan();
+    test_netcheck_choice();
     test_commands();
     test_key_expired();
     test_begin_login();

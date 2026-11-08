@@ -72,6 +72,21 @@ BaseType_t shim_queue_send(QueueHandle_t q, const void *item) {
     return pdFALSE;
 }
 
+/* DERP latency probes (ml_netcheck.c): recorded so a test can answer them. */
+int stub_binding_sent;
+uint32_t stub_binding_ip[256];
+uint8_t stub_binding_txid[256][12];
+esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t ip, uint16_t port, uint8_t txid[12]) {
+    (void)ml; (void)port;
+    for (int i = 0; i < 12; i++) txid[i] = (uint8_t)(stub_binding_sent * 13 + i + 1);
+    if (stub_binding_sent < 256) {
+        stub_binding_ip[stub_binding_sent] = ip;
+        memcpy(stub_binding_txid[stub_binding_sent], txid, 12);
+    }
+    stub_binding_sent++;
+    return ESP_OK;
+}
+
 /* STUN is not part of the registration path. */
 esp_err_t ml_stun_resolve_servers(microlink_t *ml) { (void)ml; return ESP_FAIL; }
 esp_err_t ml_stun_send_probe(microlink_t *ml, const char *s, uint16_t p) { (void)ml; (void)s; (void)p; return ESP_FAIL; }
