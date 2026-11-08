@@ -535,7 +535,14 @@ void ml_derp_tx_task(void *arg) {
                     ESP_LOGW(TAG, "DERP connect attempt %d failed", attempt + 1);
                 }
             }
-            if (bits & ML_EVT_DERP_RECONNECT) {
+            if ((bits & ML_EVT_DERP_RECONNECT) && ml->derp.connected &&
+                ml->derp.target_gen == ml->derp_target_gen &&
+                ml->derp.region == ml->derp_home_region) {
+                /* The request predates this connection: it completed after the last
+                 * rebind or region change, to the home region. Keep it. */
+                xEventGroupClearBits(ml->events, ML_EVT_DERP_RECONNECT);
+                ESP_LOGI(TAG, "DERP reconnect request predates the current connection, kept");
+            } else if (bits & ML_EVT_DERP_RECONNECT) {
                 xEventGroupClearBits(ml->events, ML_EVT_DERP_RECONNECT);
                 ESP_LOGW(TAG, "DERP reconnect requested (was %s)",
                          ml->derp.connected ? "connected" : "disconnected");
@@ -993,6 +1000,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     }
 
     ml->derp.region = region;
+    ml->derp.target_gen = ml->derp_target_gen;
     ml->derp.connected = true;
     ml->derp.last_recv_ms = ml_get_time_ms();
     xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECTED);

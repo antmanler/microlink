@@ -2317,6 +2317,7 @@ static void coord_handle_stun_packet(microlink_t *ml, ml_noise_state_t *noise,
  * open the control plane hears the new PreferredDERP at once. */
 static void coord_home_changed(microlink_t *ml, ml_noise_state_t *noise, bool long_poll_open) {
     ESP_LOGI(TAG, "Home DERP region: %u", ml->derp_home_region);
+    ml->derp_target_gen++;
     if (ml->derp.connected && ml->derp.region != ml->derp_home_region) {
         xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
     }
@@ -2362,6 +2363,20 @@ static void coord_handle_command(microlink_t *ml, coord_state_t *state, ml_coord
         }
         *state = COORD_IDLE;
         ml->state = ML_STATE_IDLE;
+        break;
+    case ML_CMD_REBIND:
+        /* The public endpoint and NAT type belonged to the old network: never
+         * advertise them again. STUN and netcheck run afresh on the new one. */
+        ml->stun_public_ip = 0;
+        ml->stun_public_port = 0;
+        ml->stun_has_ipv6 = false;
+        memset(ml->stun_public_ip6, 0, sizeof(ml->stun_public_ip6));
+        ml->stun_public_port6 = 0;
+        ml->stun_secondary_port = 0;
+        ml->stun_nat_checked = false;
+        ml->nat_mapping_varies = false;
+        ml_netcheck_request_full(ml);
+        if (*state != COORD_FAILED) *state = COORD_RECONNECTING;
         break;
     case ML_CMD_FORCE_RECONNECT:
         if (*state != COORD_FAILED) *state = COORD_RECONNECTING;

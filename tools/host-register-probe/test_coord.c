@@ -740,7 +740,33 @@ static void test_priority_admission(void) {
     CHECK(ml_peer_admit_slot(peers, ML_MAX_PEERS, true, &evict) == 11 && !evict);
 }
 
+/* ---- rebind: the old network's STUN endpoint is never advertised again ------ */
+
+static void test_rebind_clears_stun(void) {
+    microlink_t *ml = new_ml(false);
+    for (int pass = 0; pass < 2; pass++) {
+        ml->stun_public_ip = 0xCB007101u;          /* 203.0.113.1, placeholder */
+        ml->stun_public_port = 41641;
+        ml->stun_has_ipv6 = true;
+        ml->stun_public_ip6[0] = 0x20;
+        ml->stun_public_port6 = 41641;
+        ml->stun_nat_checked = true;
+        ml->nat_mapping_varies = true;
+        ml->netcheck.next_full = false;
+        coord_state_t st = pass == 0 ? COORD_LONG_POLL : COORD_FAILED;
+        coord_handle_command(ml, &st, ML_CMD_REBIND);
+        CHECK(ml->stun_public_ip == 0 && ml->stun_public_port == 0);
+        CHECK(!ml->stun_has_ipv6 && ml->stun_public_ip6[0] == 0 && ml->stun_public_port6 == 0);
+        CHECK(!ml->stun_nat_checked && !ml->nat_mapping_varies);
+        CHECK(ml->netcheck.next_full);
+        /* Reconnects like FORCE_RECONNECT; a terminal error stays terminal. */
+        CHECK(st == (pass == 0 ? COORD_RECONNECTING : COORD_FAILED));
+    }
+    free(ml);
+}
+
 int main(void) {
+    test_rebind_clears_stun();
     test_priority_name_match();
     test_priority_setter();
     test_priority_marked_on_every_netmap();

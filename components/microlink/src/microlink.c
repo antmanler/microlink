@@ -515,6 +515,9 @@ esp_err_t microlink_rebind(microlink_t *ml) {
 
     ESP_LOGI(TAG, "=== Rebinding to new network interface ===");
 
+    /* DERP connections from here on are on the new network (see derp_target_gen). */
+    ml->derp_target_gen++;
+
     /* Step 1: Invalidate socket FDs FIRST, then delay to let net_io_task's
      * select() cycle complete (50ms timeout). Only THEN close the old FDs.
      * Closing a socket while another thread has it in select() deadlocks
@@ -542,7 +545,7 @@ esp_err_t microlink_rebind(microlink_t *ml) {
      * STUN → DNS → TCP → Noise → Register → MapRequest flow.
      * Peers and WG state are preserved. */
     xEventGroupClearBits(ml->events, ML_EVT_COORD_REGISTERED);
-    ml_coord_cmd_t cmd = ML_CMD_FORCE_RECONNECT;
+    ml_coord_cmd_t cmd = ML_CMD_REBIND;     /* also drops the old STUN endpoint */
     xQueueSend(ml->coord_cmd_queue, &cmd, pdMS_TO_TICKS(100));
 
     /* Step 3: Signal DERP to reconnect. ML_EVT_DERP_RECONNECT triggers

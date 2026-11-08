@@ -230,6 +230,7 @@ typedef enum {
     ML_CMD_FORCE_RECONNECT,     /* Force reconnection (after DERP failure, etc.); never clears ERROR */
     ML_CMD_RETRY,               /* microlink_retry(): leave a retryable ERROR and reconnect */
     ML_CMD_RESYNC_NETMAP,       /* read the full netmap again (priority peer name changed) */
+    ML_CMD_REBIND,              /* microlink_rebind(): drop network-bound state, then as FORCE_RECONNECT */
 } ml_coord_cmd_t;
 
 /* Peer update (from coord to wg_mgr) */
@@ -405,6 +406,7 @@ typedef struct {
     mbedtls_ctr_drbg_context ctr_drbg;
     bool connected;
     uint16_t region;                /* region of the current connection */
+    uint32_t target_gen;            /* derp_target_gen when this connection completed */
     uint64_t last_recv_ms;          /* For keepalive watchdog */
 } ml_derp_conn_t;
 
@@ -448,6 +450,9 @@ struct microlink_s {
     /* DERP connection (owned exclusively by DERP I/O task after connect) */
     /* Connection setup by coord task, then handed to DERP I/O task */
     ml_derp_conn_t derp;
+    /* Bumped on every network rebind and home region change. A reconnect request
+     * leaves a connection alone that completed after the last bump, to the home region. */
+    volatile uint32_t derp_target_gen;
 
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */
