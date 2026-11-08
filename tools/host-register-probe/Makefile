@@ -1,7 +1,8 @@
 # Host harness for the interactive-login path (DESIGN section 10, probe P3).
 #
-#   make test    unit tests of the register codec, the login getters, the coord decisions
-#                and wireguard-lwip's handshake trigger and give-up
+#   make test    unit tests of the register codec, the login getters, the coord decisions,
+#                the coord -> wg_mgr peer-update list and wireguard-lwip's handshake
+#                trigger and give-up
 #   make probe   build the P3 probe
 #   make run     run the probe against the real control server (keyless register;
 #                prints states only, never the login URL)
@@ -26,7 +27,7 @@ LDLIBS   := -lm
 
 MBED_SRC := chacha20 chachapoly poly1305 platform_util platform constant_time base64
 LIB_SRC  := $(ML)/src/ml_register.c $(ML)/src/ml_login.c $(ML)/src/ml_h2.c $(ML)/src/ml_noise.c \
-            $(ML)/src/ml_netcheck.c $(ML)/src/ml_peer_policy.c \
+            $(ML)/src/ml_netcheck.c $(ML)/src/ml_peer_policy.c $(ML)/src/ml_peer_updates.c \
             $(ML)/src/x25519.c $(WG)/crypto/refc/blake2s.c $(CJSON)/cJSON.c \
             $(addprefix $(MBEDTLS)/library/,$(addsuffix .c,$(MBED_SRC))) $(HERE)/host_stubs.c
 
@@ -47,10 +48,18 @@ $(OUT)/test_coord: $(HERE)/test_coord.c $(ML)/src/ml_coord.c $(LIB_SRC) | $(OUT)
 $(OUT)/probe: $(HERE)/probe.c $(ML)/src/ml_coord.c $(LIB_SRC) | $(OUT)
 	$(CC) $(CFLAGS) $(INCLUDES) -I$(ML)/src -o $@ $(HERE)/probe.c $(LIB_SRC) $(LDLIBS)
 
-test: $(OUT)/test_codec $(OUT)/test_coord $(OUT)/test_wg
+test: $(OUT)/test_codec $(OUT)/test_coord $(OUT)/test_wg $(OUT)/test_peer_updates
 	$(OUT)/test_codec
 	$(OUT)/test_coord
 	$(OUT)/test_wg
+	$(OUT)/test_peer_updates
+
+# The peer-update list alone, under AddressSanitizer and UBSan (a double free or a use
+# after free aborts; LeakSanitizer adds leak reports where the platform has it). The test
+# includes ml_peer_updates.c itself, to count frees and to make the lock a real mutex.
+$(OUT)/test_peer_updates: $(HERE)/test_peer_updates.c $(ML)/src/ml_peer_updates.c | $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -pthread $(INCLUDES) \
+	    -o $@ $(HERE)/test_peer_updates.c $(LDLIBS)
 
 # wireguard-lwip against IDF's lwIP headers (shim-lwip/ holds the options; test_wg.c
 # supplies the lwIP functions it links). No MicroLink shims on this include path.

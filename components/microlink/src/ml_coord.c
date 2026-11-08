@@ -1179,11 +1179,9 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
             forget_priority_peer(ml);       /* renamed, or the priority name changed */
         }
 
-        /* Send to wg_mgr task via queue */
-        if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
-            ESP_LOGW(TAG, "Peer update queue full, dropping a peer update");
-            free(update);
-        }
+        /* Hand to the wg_mgr task. Never blocks or drops: wg_mgr starts to drain only
+         * after ML_EVT_COORD_REGISTERED, which is set after the first netmap is parsed. */
+        ml_peer_updates_push(ml, update);
     }
 
 check_removed:
@@ -1209,9 +1207,7 @@ check_removed:
             hex_to_bytes(hex, update->public_key, 32);
             if (is_tracked_peer(ml, update->public_key)) forget_priority_peer(ml);
 
-            if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
-                free(update);
-            }
+            ml_peer_updates_push(ml, update);
         }
     }
 
@@ -1272,9 +1268,7 @@ check_removed:
                         update->endpoint_count = ep_count;
                     }
 
-                    if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
-                        free(update);
-                    }
+                    ml_peer_updates_push(ml, update);
                 }
             }
             patch = patch->next;

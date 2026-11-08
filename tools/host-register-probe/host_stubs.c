@@ -66,18 +66,10 @@ EventBits_t shim_event_bits_get;
 void *stub_cmd_queue;
 int stub_cmd_sent;
 int stub_cmd_last = -1;
-/* Peer updates sent to stub_peer_queue are kept for the test (it frees them). */
-void *stub_peer_queue;
-ml_peer_update_t *stub_peer_updates[64];
-int stub_peer_update_count;
 BaseType_t shim_queue_send(QueueHandle_t q, const void *item) {
     if (q != NULL && q == stub_cmd_queue) {
         stub_cmd_sent++;
         stub_cmd_last = *(const int *)item;
-        return pdTRUE;
-    }
-    if (q != NULL && q == stub_peer_queue && stub_peer_update_count < 64) {
-        stub_peer_updates[stub_peer_update_count++] = *(ml_peer_update_t *const *)item;
         return pdTRUE;
     }
     return pdFALSE;

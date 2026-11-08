@@ -621,10 +621,8 @@ static void test_netcheck_choice(void) {
 
 /* ---- C: priority peer by name ----------------------------------------------- */
 
-extern void *stub_cmd_queue, *stub_peer_queue;
+extern void *stub_cmd_queue;
 extern int stub_cmd_sent, stub_cmd_last;
-extern ml_peer_update_t *stub_peer_updates[64];
-extern int stub_peer_update_count;
 
 static void test_priority_name_match(void) {
     CHECK(ml_dns_name_equal("P4-Dock.Tail1234.TS.net.", "p4-dock.tail1234.ts.net"));
@@ -673,41 +671,127 @@ static void test_priority_setter(void) {
     free(ml);
 }
 
+/* The updates the last parse_netmap() queued, oldest first (what wg_mgr would take). */
+static ml_peer_update_t *g_updates;
+static int g_update_count;
+
+static void free_updates(void) {
+    while (g_updates) {
+        ml_peer_update_t *next = g_updates->next;
+        free(g_updates);
+        g_updates = next;
+    }
+    g_update_count = 0;
+}
+
 static void parse_netmap(microlink_t *ml, const char *json) {
-    for (int i = 0; i < stub_peer_update_count; i++) free(stub_peer_updates[i]);
-    stub_peer_update_count = 0;
+    free_updates();
     cJSON *root = cJSON_Parse(json);
     parse_peers_from_map_response(ml, root);
     cJSON_Delete(root);
+    g_updates = ml_peer_updates_take_all(ml);
+    for (const ml_peer_update_t *u = g_updates; u; u = u->next) g_update_count++;
+}
+
+static const ml_peer_update_t *update_at(int i) {
+    const ml_peer_update_t *u = g_updates;
+    while (u && i-- > 0) u = u->next;
+    return u;
 }
 
 static void test_priority_marked_on_every_netmap(void) {
     microlink_t *ml = new_ml(false);
-    int peerq;
-    ml->peer_update_queue = &peerq;
-    stub_peer_queue = &peerq;
+    ml_peer_updates_init(ml);
     const char *map = "{\"Peers\":["
         "{\"Name\":\"laptop.tail1234.ts.net.\",\"Addresses\":[\"100.64.0.2/32\"]},"
         "{\"Name\":\"P4-Dock.tail1234.ts.net.\",\"Addresses\":[\"100.64.0.3/32\"]},"
         "{\"Name\":\"p4-dock-2.tail1234.ts.net.\",\"Addresses\":[\"100.64.0.4/32\"]}]}";
 
     parse_netmap(ml, map);                                 /* no name set: none marked */
-    CHECK(stub_peer_update_count == 3);
-    for (int i = 0; i < 3; i++) CHECK(!stub_peer_updates[i]->priority);
+    CHECK(g_update_count == 3);
+    for (int i = 0; i < 3; i++) CHECK(!update_at(i)->priority);
 
     microlink_set_priority_peer_name(ml, "p4-dock.tail1234.ts.net");
     parse_netmap(ml, map);
-    CHECK(stub_peer_update_count == 3);
-    CHECK(!stub_peer_updates[0]->priority && stub_peer_updates[1]->priority &&
-          !stub_peer_updates[2]->priority);
+    CHECK(g_update_count == 3);
+    CHECK(!update_at(0)->priority && update_at(1)->priority && !update_at(2)->priority);
 
     /* A changed name moves the mark on the next netmap. */
     microlink_set_priority_peer_name(ml, "laptop.tail1234.ts.net.");
     parse_netmap(ml, map);
-    CHECK(stub_peer_updates[0]->priority && !stub_peer_updates[1]->priority);
+    CHECK(update_at(0)->priority && !update_at(1)->priority);
 
     parse_netmap(ml, "{}");
-    stub_peer_queue = NULL;
+    free_updates();
+    ml_peer_updates_deinit(ml);
+    free(ml);
+}
+
+/* A netmap lists every tailnet peer, and the coord task queues them all before wg_mgr
+ * drains: far more than any fixed queue depth. Every update must arrive, in JSON order
+ * across the three producers (Peers, PeersRemoved, PeersChangedPatch). */
+static void node_key(char *out, size_t n, int i) {
+    snprintf(out, n, "nodekey:%02x%02x%.60s", i & 255, (i >> 8) & 255,
+             "abababababababababababababababababababababababababababababab");
+}
+
+static bool key_is(const ml_peer_update_t *u, int n) {
+    return u->public_key[0] == (n & 255) && u->public_key[1] == ((n >> 8) & 255);
+}
+
+static void test_netmap_never_drops_updates(void) {
+    enum { ADDS = 500, REMOVES = 100, PATCHES = 100 };
+    size_t cap = 1 << 20, len = 0;
+    char *json = malloc(cap);
+    char key[80];
+    len += snprintf(json + len, cap - len, "{\"Peers\":[");
+    for (int i = 0; i < ADDS; i++) {
+        node_key(key, sizeof(key), i);
+        len += snprintf(json + len, cap - len,
+                        "%s{\"Name\":\"peer-%d.tail1234.ts.net.\",\"Key\":\"%s\","
+                        "\"Addresses\":[\"100.64.%d.%d/32\"]}",
+                        i ? "," : "", i, key, (i >> 8) & 255, i & 255);
+    }
+    len += snprintf(json + len, cap - len, "],\"PeersRemoved\":[");
+    for (int i = 0; i < REMOVES; i++) {
+        node_key(key, sizeof(key), 1000 + i);
+        len += snprintf(json + len, cap - len, "%s\"%s\"", i ? "," : "", key);
+    }
+    len += snprintf(json + len, cap - len, "],\"PeersChangedPatch\":{");
+    for (int i = 0; i < PATCHES; i++) {
+        node_key(key, sizeof(key), 2000 + i);
+        len += snprintf(json + len, cap - len, "%s\"%s\":{\"DERPRegion\":%d}",
+                        i ? "," : "", key, 1 + i);
+    }
+    len += snprintf(json + len, cap - len, "}}");
+    CHECK(len < cap);
+
+    microlink_t *ml = new_ml(false);
+    ml_peer_updates_init(ml);
+    parse_netmap(ml, json);
+    CHECK(g_update_count == ADDS + REMOVES + PATCHES);
+
+    const ml_peer_update_t *u = g_updates;
+    bool in_order = g_update_count == ADDS + REMOVES + PATCHES;
+    for (int i = 0; in_order && i < ADDS; i++, u = u->next) {
+        in_order = u->action == ML_PEER_ADD && key_is(u, i) &&
+                   u->vpn_ip == (0x64400000u | (uint32_t)i);
+    }
+    for (int i = 0; in_order && i < REMOVES; i++, u = u->next) {
+        in_order = u->action == ML_PEER_REMOVE && key_is(u, 1000 + i);
+    }
+    for (int i = 0; in_order && i < PATCHES; i++, u = u->next) {
+        in_order = u->action == ML_PEER_UPDATE_ENDPOINT && key_is(u, 2000 + i) &&
+                   u->derp_region == 1 + i;
+    }
+    CHECK(in_order);
+
+    /* The list is detached whole: nothing is left behind. */
+    CHECK(ml_peer_updates_take_all(ml) == NULL);
+
+    free_updates();
+    ml_peer_updates_deinit(ml);
+    free(json);
     free(ml);
 }
 
@@ -1373,6 +1457,7 @@ int main(void) {
     test_priority_name_match();
     test_priority_setter();
     test_priority_marked_on_every_netmap();
+    test_netmap_never_drops_updates();
     test_priority_admission();
     test_netcheck_plan();
     test_netcheck_choice();

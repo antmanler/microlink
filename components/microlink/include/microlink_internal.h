@@ -74,10 +74,6 @@ extern "C" {
 #define ML_WG_RX_QUEUE_DEPTH    32
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
-/* Bounds in-flight peer-update payloads (each ~208 B, malloc'd internal by
- * ml_net_io RX). 400 was underived and allowed a theoretical ~80 KB internal
- * burst; 32 = 4x the runtime max_peers=8 and caps the burst at ~6.6 KB. */
-#define ML_PEER_UPDATE_QUEUE_DEPTH 32
 
 /* Protocol limits */
 #define ML_MAX_PEERS            CONFIG_ML_MAX_PEERS
@@ -255,7 +251,7 @@ typedef enum {
 } ml_coord_cmd_t;
 
 /* Peer update (from coord to wg_mgr) */
-typedef struct {
+typedef struct ml_peer_update_s {
     enum {
         ML_PEER_ADD,
         ML_PEER_REMOVE,
@@ -274,6 +270,7 @@ typedef struct {
         bool is_ipv6;
     } endpoints[ML_MAX_ENDPOINTS];
     int endpoint_count;
+    struct ml_peer_update_s *next;  /* link of the pending list (ml_peer_updates.c) */
 } ml_peer_update_t;
 
 /* ============================================================================
@@ -517,7 +514,12 @@ struct microlink_s {
     QueueHandle_t wg_rx_queue;          /* net_io -> wg_mgr */
     QueueHandle_t stun_rx_queue;        /* net_io -> coord */
     QueueHandle_t coord_cmd_queue;      /* any -> coord */
-    QueueHandle_t peer_update_queue;    /* coord -> wg_mgr */
+
+    /* coord -> wg_mgr: pending peer updates, oldest first, with no bound.
+     * peer_updates_lock guards both pointers and every link (ml_peer_updates.c). */
+    portMUX_TYPE peer_updates_lock;
+    ml_peer_update_t *peer_updates_head;
+    ml_peer_update_t *peer_updates_tail;
 
     /* Keys (loaded at init, read-only after) */
     uint8_t machine_private_key[32];    /* Noise machine key */
@@ -783,6 +785,12 @@ const char *ml_device_name(const microlink_t *ml);   /* Hostinfo.Hostname */
 bool ml_dns_name_equal(const char *a, const char *b);
 void ml_copy_priority_name(microlink_t *ml, char *buf, size_t len);   /* "" when unset */
 int ml_peer_admit_slot(const ml_peer_t *peers, int max, bool incoming_priority, bool *evict);
+
+/* ml_peer_updates.c: coord -> wg_mgr hand-off. A FIFO list that never blocks or drops. */
+void ml_peer_updates_init(microlink_t *ml);
+void ml_peer_updates_push(microlink_t *ml, ml_peer_update_t *update);   /* takes ownership */
+ml_peer_update_t *ml_peer_updates_take_all(microlink_t *ml);   /* oldest first, linked by next; the caller frees each */
+void ml_peer_updates_deinit(microlink_t *ml);                  /* frees every update still pending */
 
 /* Utility */
 uint64_t ml_get_time_ms(void);

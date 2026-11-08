@@ -384,10 +384,10 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->wg_rx_queue = xQueueCreate(ML_WG_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
     ml->stun_rx_queue = xQueueCreate(ML_STUN_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
     ml->coord_cmd_queue = xQueueCreate(ML_COORD_CMD_QUEUE_DEPTH, sizeof(ml_coord_cmd_t));
-    ml->peer_update_queue = xQueueCreate(ML_PEER_UPDATE_QUEUE_DEPTH, sizeof(ml_peer_update_t *));
+    ml_peer_updates_init(ml);
 
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue ||
-        !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue) {
+        !ml->stun_rx_queue || !ml->coord_cmd_queue) {
         ESP_LOGE(TAG, "Failed to create queues");
         microlink_destroy(ml);
         return NULL;
@@ -715,7 +715,7 @@ esp_err_t microlink_destroy(microlink_t *ml) {
     if (ml->wg_rx_queue) vQueueDelete(ml->wg_rx_queue);
     if (ml->stun_rx_queue) vQueueDelete(ml->stun_rx_queue);
     if (ml->coord_cmd_queue) vQueueDelete(ml->coord_cmd_queue);
-    if (ml->peer_update_queue) vQueueDelete(ml->peer_update_queue);
+    ml_peer_updates_deinit(ml);   /* the tasks are gone: free what wg_mgr never took */
 
     /* Delete event group */
     if (ml->events) vEventGroupDelete(ml->events);

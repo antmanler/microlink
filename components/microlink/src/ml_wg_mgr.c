@@ -3,7 +3,7 @@
  * @brief WireGuard Manager Task - Peer Management + DISCO
  *
  * Owns ALL peer state exclusively. Handles:
- * - Peer add/remove/update from coord task (via peer_update_queue)
+ * - Peer add/remove/update from coord task (via the ml_peer_updates list)
  * - DISCO ping/pong with rate limiting (matching tailscaled timing)
  * - WireGuard peer provisioning via wireguard-lwip
  * - Direct path discovery and endpoint switching
@@ -645,9 +645,10 @@ static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
 }
 
 static void process_peer_updates(microlink_t *ml) {
-    ml_peer_update_t *update;
-    while (xQueueReceive(ml->peer_update_queue, &update, 0) == pdTRUE) {
-        if (!update) continue;
+    /* Detached under the lock, handled outside it. */
+    ml_peer_update_t *update = ml_peer_updates_take_all(ml);
+    while (update) {
+        ml_peer_update_t *next = update->next;
         switch (update->action) {
         case ML_PEER_ADD:
             add_peer(ml, update);
@@ -679,6 +680,7 @@ static void process_peer_updates(microlink_t *ml) {
             break;
         }
         free(update);
+        update = next;
     }
 }
 
