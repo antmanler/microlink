@@ -1041,6 +1041,49 @@ static void test_dns_async(void) {
     free(ml);
 }
 
+/* The bound peer's region is retried every full round; other failed regions are not. */
+static void test_priority_region_retried(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    microlink_set_priority_peer_name(ml, "p4-dock.tail1234.ts.net");
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":[{\"Name\":\"p4-dock.tail1234.ts.net.\","
+                     "\"Key\":\"" PRIO_KEY "\",\"HomeDERP\":902}]}") == 0);
+    int64_t t = 8000000000LL;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    ml_netcheck_end(ml, t + 1000);
+    CHECK(ml->derp_home_region == 902 && ml->netcheck.latency_home == 901);
+    /* 902's DERP connects keep failing: the latency choice. */
+    ml->derp_failed_region = 902;
+    t += 30000000;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 901);
+    /* An incremental round keeps it excluded. */
+    t += 30000000;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    CHECK(!ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 901);
+    /* A full round tries it again (the DERP task follows with its backoff). */
+    t += ML_NC_FULL_INTERVAL_MS * 1000LL;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    CHECK(!ml->derp_regions[region_idx(ml, 902)].derp_failed && ml->derp_failed_region == 0);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+    /* The connect succeeds (a frame): it stays home through the next full round. */
+    ml->derp_ok_region = 902;
+    t += ML_NC_FULL_INTERVAL_MS * 1000LL;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    CHECK(!ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+    /* A failed non-priority region is not retried by a full round. */
+    ml->derp_failed_region = 901;
+    t += 30000000;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    ml_netcheck_end(ml, t + 1000);
+    t += ML_NC_FULL_INTERVAL_MS * 1000LL;
+    nc_round(ml, t, 0xC0000201u, 20000, 0xC6336401u, 80000);
+    CHECK(ml->derp_regions[region_idx(ml, 901)].derp_failed);
+    ml_netcheck_end(ml, t + 1000);
+    free(ml->netcheck.probes);
+    free(ml);
+}
+
 static void test_priority_cleared(void) {
     microlink_t *ml = new_ml(false);
     ml->t_stun_interval_ms = 23000;
@@ -1184,6 +1227,7 @@ int main(void) {
     test_derp_retry();
     test_effective_home_usable();
     test_priority_cleared();
+    test_priority_region_retried();
     test_stop_and_drain();
     test_rtt_from_receive_time();
     test_map_edits();

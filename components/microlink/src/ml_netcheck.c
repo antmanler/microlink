@@ -391,7 +391,17 @@ bool ml_netcheck_begin(microlink_t *ml, int64_t now_us) {
     nc->next_full = false;
     nc->last_round_ms = now_ms;
     nc->ran = true;
-    if (full) nc->last_full_ms = now_ms;
+    if (full) {
+        nc->last_full_ms = now_ms;
+        /* The priority peer's region gets another try every full round: while it is
+         * excluded nothing we send reaches that peer. Other regions keep their
+         * exclusion until a connection to them carries a frame. */
+        uint16_t pr = nc->peer_key_valid ? nc->peer_region : 0;
+        for (int i = 0; pr && i < ml->derp_region_count; i++) {
+            if (ml->derp_regions[i].region_id == pr) ml->derp_regions[i].derp_failed = false;
+        }
+        if (pr && ml->derp_failed_region == pr) ml->derp_failed_region = 0;
+    }
 
     dns_harvest(ml);
     dns_request(ml);
