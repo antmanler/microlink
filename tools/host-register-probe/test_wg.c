@@ -72,8 +72,14 @@ err_t pbuf_take(struct pbuf *buf, const void *dataptr, u16_t len) {
     return ERR_OK;
 }
 
-void netif_set_link_up(struct netif *netif) { (void)netif; }
-void netif_set_link_down(struct netif *netif) { (void)netif; }
+/* Link state as lwIP keeps it (netif.c sets/clears NETIF_FLAG_LINK_UP). */
+void netif_set_link_up(struct netif *netif) { netif->flags |= NETIF_FLAG_LINK_UP; }
+void netif_set_link_down(struct netif *netif) { netif->flags &= (u8_t)~NETIF_FLAG_LINK_UP; }
+
+/* lwIP routes a packet to a netif only when it is up and its link is up
+ * (IDF 5.5.3 lwip ip4.c ip4_route, lwip_default_hooks.c). Anything else goes out
+ * the default route: for the tailnet range, a leak to the LAN gateway. */
+static bool routes_to(const struct netif *n) { return netif_is_up(n) && netif_is_link_up(n); }
 void sys_timeout(u32_t msecs, sys_timeout_handler handler, void *arg) { (void)msecs; (void)handler; (void)arg; }
 void sys_untimeout(sys_timeout_handler handler, void *arg) { (void)handler; (void)arg; }
 struct udp_pcb *udp_new(void) { return NULL; }
@@ -81,8 +87,11 @@ err_t udp_bind(struct udp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port) { (void
 void udp_bind_netif(struct udp_pcb *pcb, const struct netif *netif) { (void)pcb; (void)netif; }
 void udp_recv(struct udp_pcb *pcb, udp_recv_fn recv, void *recv_arg) { (void)pcb; (void)recv; (void)recv_arg; }
 void udp_remove(struct udp_pcb *pcb) { (void)pcb; }
+static int g_direct_initiations;
 err_t udp_sendto(struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *dst_ip, u16_t dst_port) {
-    (void)pcb; (void)p; (void)dst_ip; (void)dst_port; return ERR_OK;
+    (void)pcb; (void)dst_ip; (void)dst_port;
+    if (p->tot_len > 0 && ((const uint8_t *)p->payload)[0] == MESSAGE_HANDSHAKE_INITIATION) g_direct_initiations++;
+    return ERR_OK;
 }
 
 /* DERP output: count handshake initiations (message type 1). */
@@ -119,6 +128,9 @@ static void setup(void) {
     wireguardif_disable_socket_bind();
     if (wireguardif_init(&g_netif) != ERR_OK) { printf("wireguardif_init failed\n"); exit(2); }
     wireguardif_set_derp_output(&g_netif, derp_out, NULL);
+    /* As ml_wg_mgr.c wg_init_interface(): the netif is brought up with its link up. */
+    g_netif.flags |= NETIF_FLAG_UP;
+    netif_set_link_up(&g_netif);
 
     struct wireguardif_peer p;
     wireguardif_peer_init(&p);
@@ -159,9 +171,11 @@ static void test_outbound_starts_handshake_and_cap_stops_it(void) {
     CHECK(MAX_TIMER_HANDSHAKES == 18);                 /* wireguard-go 90 s / 5 s */
     CHECK(MAX_HANDSHAKE_INITIATIONS == 20);
 
-    /* No session and nobody asked: the passive peer sends nothing. */
+    /* No session and nobody asked: the passive peer sends nothing, and the netif
+     * still takes tailnet packets (no link-down for lack of a session). */
     run_timer(30);
     CHECK(g_initiations == 0);
+    CHECK(routes_to(&g_netif));
     CHECK(wireguardif_take_send_request(&g_netif, g_peer) == WIREGUARDIF_SEND_NONE);
 
     /* An app packet without a session is dropped, never blocks, and marks the peer. */
@@ -190,6 +204,7 @@ static void test_outbound_starts_handshake_and_cap_stops_it(void) {
     run_timer(REKEY_ATTEMPT_TIME + 30);
     CHECK(g_initiations == 2 * MAX_HANDSHAKE_INITIATIONS);
     CHECK(!peer()->active);
+    CHECK(routes_to(&g_netif));
 }
 
 static void test_send_within_rekey_timeout_restarts_retries(void) {
@@ -222,11 +237,54 @@ static void test_session_present_needs_nothing(void) {
     CHECK(wireguardif_take_send_request(&g_netif, WIREGUARD_MAX_PEERS - 1) == WIREGUARDIF_SEND_NONE);
 }
 
+/* A peer that had a session, went away, and came back: the previous keypair dies at
+ * REJECT_AFTER_TIME, so the peer no longer looks up and a send starts a handshake
+ * even after an earlier cycle gave up. */
+static void test_peer_back_from_away(void) {
+    struct wireguard_peer *pp = peer();
+    pp->active = false;                       /* an earlier cycle gave up */
+    pp->curr_keypair.valid = false;
+    pp->prev_keypair.valid = true;            /* left over from the old session */
+    pp->prev_keypair.keypair_millis = g_now_ms;
+    CHECK(wireguardif_peer_is_up(&g_netif, g_peer, NULL, NULL) == ERR_OK);
+    run_timer(REJECT_AFTER_TIME + 1);
+    CHECK(!pp->prev_keypair.valid);
+    CHECK(wireguardif_peer_is_up(&g_netif, g_peer, NULL, NULL) == ERR_CONN);
+    CHECK(routes_to(&g_netif));
+
+    CHECK(send_app_packet() == ERR_CONN);
+    CHECK(wireguardif_take_send_request(&g_netif, g_peer) == WIREGUARDIF_SEND_INITIATE);
+    CHECK(pp->active && pp->handshake_attempts == 0);
+}
+
+/* One initiation on one path: DERP unless a confirmed direct endpoint is given. */
+static void test_initiate_single_path(void) {
+    int derp0 = g_initiations, direct0 = g_direct_initiations;
+    g_now_ms += REKEY_TIMEOUT * 1000;
+    CHECK(wireguardif_initiate(&g_netif, g_peer, NULL, 0) == ERR_OK);
+    CHECK(g_initiations == derp0 + 1 && g_direct_initiations == direct0);
+    CHECK(ip_addr_isany(&peer()->ip));
+
+    ip_addr_t ep;
+    IP_ADDR4(&ep, 192, 0, 2, 9);              /* documentation address */
+    g_now_ms += REKEY_TIMEOUT * 1000;
+    CHECK(wireguardif_initiate(&g_netif, g_peer, &ep, 41641) == ERR_OK);
+    CHECK(g_initiations == derp0 + 1 && g_direct_initiations == direct0 + 1);
+    CHECK(!ip_addr_isany(&peer()->ip) && peer()->port == 41641);
+
+    /* Direct path lost without a session: retries go to DERP, nothing sent now. */
+    CHECK(wireguardif_use_derp(&g_netif, g_peer) == ERR_OK);
+    CHECK(ip_addr_isany(&peer()->ip) && peer()->port == 0);
+    CHECK(g_initiations == derp0 + 1 && g_direct_initiations == direct0 + 1);
+}
+
 int main(void) {
     setup();
     test_outbound_starts_handshake_and_cap_stops_it();
     test_send_within_rekey_timeout_restarts_retries();
     test_session_present_needs_nothing();
+    test_peer_back_from_away();
+    test_initiate_single_path();
     printf("%d wireguard checks, %d failed\n", g_total, g_failed);
     return g_failed ? 1 : 0;
 }

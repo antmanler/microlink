@@ -407,9 +407,6 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		WG_DEBUG("[WG] Session started, sending keepalive to %s:%u\n",
 		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
 		wireguardif_send_keepalive(device, peer);
-
-		// Set the IF-UP flag on netif
-		netif_set_link_up(device->netif);
 		WG_DEBUG("[WG] *** WIREGUARD SESSION ESTABLISHED wg_idx=%u ***\n", wg_idx);
 	} else {
 		// Packet bad
@@ -498,9 +495,6 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					if (keypair->initiator && wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval - REKEY_TIMEOUT)) {
 						peer->send_handshake = true;
 					}
-
-					// Make sure that link is reported as up
-					netif_set_link_up(device->netif);
 
 					if (pbuf->tot_len > 0) {
 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
@@ -992,6 +986,24 @@ err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *cu
 	return result;
 }
 
+err_t wireguardif_initiate(struct netif *netif, u8_t peer_index, const ip_addr_t *direct_ip, u16_t direct_port) {
+	if (direct_ip && !ip_addr_isany(direct_ip) && direct_port > 0) {
+		err_t r = wireguardif_update_endpoint(netif, peer_index, direct_ip, direct_port);
+		return r == ERR_OK ? wireguardif_connect(netif, peer_index) : r;
+	}
+	return wireguardif_connect_derp(netif, peer_index);
+}
+
+err_t wireguardif_use_derp(struct netif *netif, u8_t peer_index) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		ip_addr_set_any(false, &peer->ip);
+		peer->port = 0;
+	}
+	return result;
+}
+
 int wireguardif_take_send_request(struct netif *netif, u8_t peer_index) {
 	struct wireguard_peer *peer;
 	if (wireguardif_lookup_peer(netif, peer_index, &peer) != ERR_OK || !peer->send_requested) {
@@ -1004,11 +1016,11 @@ int wireguardif_take_send_request(struct netif *netif, u8_t peer_index) {
 	// wireguard-go SendHandshakeInitiation(isRetry=false): a send resets the
 	// give-up count, then honours the REKEY_TIMEOUT spacing between initiations.
 	peer->handshake_attempts = 0;
+	peer->active = true;	// retries follow until the cap
 	if (wireguardif_can_send_initiation(peer)) {
 		return WIREGUARDIF_SEND_INITIATE;
 	}
 	// An initiation is in flight: let the timer retransmit it.
-	peer->active = true;
 	return WIREGUARDIF_SEND_RETRYING;
 }
 
@@ -1153,6 +1165,14 @@ static bool should_destroy_current_keypair(struct wireguard_peer *peer) {
 	return result;
 }
 
+// wireguard-go receive.go drops packets on a keypair older than RejectAfterTime, and
+// sends only on the current one: an older previous keypair is dead. Without this it
+// lived on after the current one expired and made the peer look "up" forever.
+static bool should_destroy_previous_keypair(struct wireguard_peer *peer) {
+	return peer->prev_keypair.valid &&
+		wireguard_expired(peer->prev_keypair.keypair_millis, REJECT_AFTER_TIME);
+}
+
 static bool should_reset_peer(struct wireguard_peer *peer) {
 	bool result = false;
 	if (peer->curr_keypair.valid && (wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME * 3))) {
@@ -1173,7 +1193,6 @@ static void wireguardif_tmr(void *arg) {
 	sys_timeout(WIREGUARDIF_TIMER_MSECS, wireguardif_tmr, device);
 
 	// Check periodic things
-	bool link_up = false;
 	for (x=0; x < WIREGUARD_MAX_PEERS; x++) {
 		peer = &device->peers[x];
 		if (peer->valid) {
@@ -1193,23 +1212,18 @@ static void wireguardif_tmr(void *arg) {
 				// Destroy current keypair
 				keypair_destroy(&peer->curr_keypair);
 			}
+			if (should_destroy_previous_keypair(peer)) {
+				keypair_destroy(&peer->prev_keypair);
+			}
 			if (should_send_keepalive(peer)) {
 				wireguardif_send_keepalive(device, peer);
 			}
 			if (should_send_initiation(peer)) {
 				wireguard_start_handshake(device->netif, peer);
 			}
-
-			if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
-				link_up = true;
-			}
 		}
 	}
-
-	if (!link_up) {
-		// Clear the IF-UP flag on netif
-		netif_set_link_down(device->netif);
-	}
+	// The link stays up without a session: see wireguardif_periodic().
 }
 
 void wireguardif_periodic(struct netif *netif) {
@@ -1222,7 +1236,6 @@ void wireguardif_periodic(struct netif *netif) {
 
 	// Perform the same work as wireguardif_tmr but from the caller's task context,
 	// avoiding heavy crypto (X25519, ChaCha20-Poly1305) on the lwIP TCPIP thread.
-	bool link_up = false;
 	for (x = 0; x < WIREGUARD_MAX_PEERS; x++) {
 		peer = &device->peers[x];
 		if (peer->valid) {
@@ -1235,6 +1248,9 @@ void wireguardif_periodic(struct netif *netif) {
 			}
 			if (should_destroy_current_keypair(peer)) {
 				keypair_destroy(&peer->curr_keypair);
+			}
+			if (should_destroy_previous_keypair(peer)) {
+				keypair_destroy(&peer->prev_keypair);
 			}
 			if (should_send_keepalive(peer)) {
 				wireguardif_send_keepalive(device, peer);
@@ -1252,14 +1268,12 @@ void wireguardif_periodic(struct netif *netif) {
 				       peer->active, peer->send_handshake);
 				wireguard_start_handshake(device->netif, peer);
 			}
-			if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
-				link_up = true;
-			}
 		}
 	}
-	if (!link_up) {
-		netif_set_link_down(device->netif);
-	}
+	// The netif link is never taken down for lack of a session. lwIP routes only to
+	// link-up netifs, so a down link sent tailnet packets out the default route
+	// instead: no handshake started and the traffic leaked to the LAN gateway. A
+	// peer without a session answers ERR_CONN and marks a handshake (send_requested).
 }
 
 err_t wireguardif_init(struct netif *netif) {
@@ -1358,7 +1372,7 @@ err_t wireguardif_init(struct netif *netif) {
 								netif->hwaddr_len = 0;
 								netif->mtu = WIREGUARDIF_MTU;
 								// We set up no state flags here - caller should set them
-								// NETIF_FLAG_LINK_UP is automatically set/cleared when at least one peer is connected
+								// The caller owns NETIF_FLAG_LINK_UP; this driver never clears it
 								netif->flags = 0;
 
 								udp_recv(udp, wireguardif_network_rx, device);

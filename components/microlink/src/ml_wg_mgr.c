@@ -1291,20 +1291,25 @@ void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip) {
     }
 }
 
-/* On-demand WG handshake trigger (called from TCP/UDP API when session needed).
- *
- * Dual-path strategy:
- * 1. DERP: Always send via DERP relay (reliable, works through all NATs)
- * 2. Direct: If DISCO has discovered a direct endpoint, ALSO send the
- *    handshake init directly to the peer's UDP port. This is critical
- *    because the direct path hits magicsock's receiveIPv4() handler which
- *    calls noteRecvActivity() → maybeReconfigWireguardLocked() to re-add
- *    trimmed peers to wireguard-go. The DERP path alone does NOT trigger
- *    this re-add for WG handshake packets, so idle peers silently drop
- *    DERP-only handshake inits.
- *
- * The direct handshake arrives at the peer's magicsock UDP socket, wakes
- * the lazy peer, and wireguard-go processes the init and responds. */
+/* One handshake initiation to peer p, on one path: direct when DISCO currently
+ * trusts a direct path, else DERP. Two initiations (DERP then direct) used to be
+ * sent; the second replaced the handshake state, so the DERP reply failed, and the
+ * retries went to a direct address that may be stale. */
+static void start_handshake(microlink_t *ml, ml_peer_t *p) {
+    struct netif *netif = (struct netif *)ml->wg_netif;
+    if (p->has_direct_path && p->best_ip != 0 && p->best_port != 0) {
+        ip_addr_t ep_ip;
+        IP_SET_TYPE_VAL(ep_ip, IPADDR_TYPE_V4);
+        ip4_addr_set_u32(ip_2_ip4(&ep_ip), htonl(p->best_ip));
+        wireguardif_initiate(netif, (u8_t)p->wg_peer_index, &ep_ip, p->best_port);
+        ESP_LOGI(TAG, "WG handshake triggered (direct) to peer %d", PEER_SLOT(p));
+    } else {
+        wireguardif_initiate(netif, (u8_t)p->wg_peer_index, NULL, 0);
+        ESP_LOGI(TAG, "WG handshake triggered (DERP) to peer %d", PEER_SLOT(p));
+    }
+}
+
+/* On-demand WG handshake trigger (TCP/UDP API, before a connect). */
 esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
     if (!ml || !ml->wg_netif) return ESP_ERR_INVALID_STATE;
 
@@ -1314,30 +1319,11 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
     ml_peer_t *p = &ml->peers[idx];
     if (p->wg_peer_index < 0) return ESP_ERR_INVALID_STATE;
 
-    struct netif *netif = (struct netif *)ml->wg_netif;
-
     /* Don't destroy an existing valid session */
-    err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index, NULL, NULL);
+    err_t is_up = wireguardif_peer_is_up((struct netif *)ml->wg_netif, (u8_t)p->wg_peer_index, NULL, NULL);
     if (is_up == ERR_OK) return ESP_OK;
 
-    /* Path 1: DERP (reliable fallback) */
-    wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
-    ESP_LOGI(TAG, "WG handshake triggered (DERP) to peer %d", PEER_SLOT(p));
-
-    /* Path 2: Direct UDP (if DISCO has a known endpoint).
-     * This wakes the peer's magicsock via receiveIPv4 → noteRecvActivity.
-     * Set connect_ip first, then call wireguardif_connect which copies
-     * connect_ip → ip and starts a second handshake to the direct endpoint. */
-    if (p->best_ip != 0 && p->best_port != 0) {
-        ip_addr_t ep_ip;
-        IP_SET_TYPE_VAL(ep_ip, IPADDR_TYPE_V4);
-        ip4_addr_set_u32(ip_2_ip4(&ep_ip), htonl(p->best_ip));
-        wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
-                                     &ep_ip, p->best_port);
-        wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-        ESP_LOGI(TAG, "WG handshake triggered (direct) to peer %d", PEER_SLOT(p));
-    }
-
+    start_handshake(ml, p);
     return ESP_OK;
 }
 
@@ -1350,10 +1336,11 @@ static void service_send_requests(microlink_t *ml) {
     for (int i = 0; i < ml->peer_count; i++) {
         ml_peer_t *p = &ml->peers[i];
         if (!p->active || p->wg_peer_index < 0) continue;
+        /* No is_up guard: wireguard-lwip already found no usable current keypair. */
         if (wireguardif_take_send_request(netif, (u8_t)p->wg_peer_index) ==
             WIREGUARDIF_SEND_INITIATE) {
             ESP_LOGI(TAG, "Outbound traffic to peer %d without a session: handshake", i);
-            ml_wg_mgr_trigger_handshake(ml, p->vpn_ip);
+            start_handshake(ml, p);
         }
     }
 }
@@ -1441,6 +1428,9 @@ static void disco_periodic_probes(microlink_t *ml) {
                     if (is_up == ERR_OK) {
                         wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
                         ESP_LOGI(TAG, "  WG session active, falling back to DERP for peer %d", PEER_SLOT(p));
+                    } else {
+                        /* No session: just stop pointing retries at the lost path. */
+                        wireguardif_use_derp(netif, (u8_t)p->wg_peer_index);
                     }
                 }
 

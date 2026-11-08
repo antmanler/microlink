@@ -139,6 +139,14 @@ err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *cu
 #define WIREGUARDIF_SEND_RETRYING	2
 int wireguardif_take_send_request(struct netif *netif, u8_t peer_index);
 
+// Send one handshake initiation: to direct_ip:direct_port when given (a path the
+// caller has confirmed), otherwise over DERP. One initiation on one path: a second
+// one would replace the pending handshake state and the first reply would fail.
+err_t wireguardif_initiate(struct netif *netif, u8_t peer_index, const ip_addr_t *direct_ip, u16_t direct_port);
+
+// Point the peer's output at DERP without sending anything (direct path lost).
+err_t wireguardif_use_derp(struct netif *netif, u8_t peer_index);
+
 // Register a DERP relay output callback for peers without direct endpoints
 // This callback is invoked when a WireGuard packet needs to be sent to a peer
 // that has no direct IP endpoint (ip is 0.0.0.0 or port is 0)
