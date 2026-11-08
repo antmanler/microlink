@@ -200,7 +200,8 @@ typedef struct {
 #define ML_EVT_SHUTDOWN_REQUEST     BIT6
 #define ML_EVT_DERP_RECONNECT       BIT7
 #define ML_EVT_DERP_CONNECT_REQ     BIT8
-/* Set by each task right before it deletes itself; microlink_stop() waits for them. */
+/* Set by each task as it stops (ml_task_exit); microlink_stop() waits for them, then
+ * deletes the suspended task. */
 #define ML_EVT_EXIT_NET_IO          BIT9
 #define ML_EVT_EXIT_DERP            BIT10
 #define ML_EVT_EXIT_COORD           BIT11
@@ -244,6 +245,8 @@ typedef enum {
     ML_CMD_RETRY,               /* microlink_retry(): leave a retryable ERROR and reconnect */
     ML_CMD_RESYNC_NETMAP,       /* read the full netmap again (priority peer name changed) */
     ML_CMD_REBIND,              /* microlink_rebind(): drop network-bound state, then as FORCE_RECONNECT */
+    ML_CMD_SHUTDOWN_WAKE,       /* microlink_stop(): end a wait on the command queue */
+    ML_CMD_PRIORITY_CLEARED,    /* the priority name was cleared: recompute the home region */
 } ml_coord_cmd_t;
 
 /* Peer update (from coord to wg_mgr) */
@@ -326,7 +329,6 @@ typedef struct {
     bool stun_only;         /* true if node only serves STUN, not DERP */
     uint32_t stun_ipv4;     /* IPv4 for latency probes, host order; 0 = not resolved */
     bool stun_dns_failed;   /* host name lookup failed for this map: not retried */
-    volatile bool stun_dns_pending;   /* an asynchronous lookup is running */
 } ml_derp_node_t;
 
 typedef struct {
@@ -345,6 +347,15 @@ typedef struct {
  * randomized to 0.5-1.5x. A region whose wait reached the maximum counts as failing. */
 #define ML_DERP_BACKOFF_STEP_MS     10
 #define ML_DERP_BACKOFF_MAX_MS      5000
+
+/* DERP task connect retry state (pure logic in ml_netcheck.c, host-tested). */
+typedef struct {
+    int failures;           /* attempts in a row to `region` without a frame read */
+    uint16_t region;        /* region of the last attempt / current connection */
+    uint64_t next_ms;       /* earliest next attempt */
+    bool home_decided;      /* a connect request came while registered */
+    bool awaiting_frame;    /* connected, no frame read yet */
+} ml_derp_retry_t;
 
 /* ============================================================================
  * DERP home region by measured latency (ml_netcheck.c, owned by coord task)
@@ -386,8 +397,28 @@ typedef struct {
     uint32_t latency_us;
 } ml_nc_sample_t;
 
+/* DERP node name lookups (ml_stun.c): one batch at a time, one name at a time on
+ * the tcpip thread (lwIP's DNS table is small and shared with every other lookup).
+ * The job owns copies of the names, never pointers into the DERP map. */
+enum { ML_DNS_PENDING, ML_DNS_OK, ML_DNS_FAILED, ML_DNS_RETRY };
 typedef struct {
-    ml_nc_probe_t *probes;                  /* PSRAM, only while a round runs */
+    char host[sizeof(((ml_derp_node_t *)0)->hostname)];
+    uint32_t ipv4;          /* host order, ML_DNS_OK only */
+    uint8_t status;         /* FAILED: the name did not resolve; RETRY: a local error */
+} ml_dns_item_t;
+
+typedef struct {
+    volatile bool done;     /* tcpip thread: every item has its status */
+    bool detached;          /* tcpip thread only: the owner is gone, free on finish */
+    bool stepping;          /* tcpip thread only */
+    int next;               /* tcpip thread only */
+    int count;
+    ml_dns_item_t items[];
+} ml_dns_job_t;
+
+typedef struct {
+    ml_nc_probe_t *probes;                  /* PSRAM; a round's probes stay until the next
+                                             * round so its late replies are recognised */
     int probe_count;
     int64_t start_us;
     uint32_t lat_us[ML_MAX_DERP_REGIONS];   /* this round, by derp_regions index; 0 = no reply */
@@ -405,7 +436,9 @@ typedef struct {
      * that region is in the DERP map it is our home, so our DERP sends reach it. */
     uint8_t peer_key[32];
     bool peer_key_valid;
+    uint32_t peer_ip;                       /* its VPN address */
     uint16_t peer_region;
+    ml_dns_job_t *dns_job;                  /* node name lookups in flight */
 } ml_netcheck_t;
 
 /* ============================================================================
@@ -463,6 +496,10 @@ struct microlink_s {
     TaskHandle_t derp_tx_task;
     TaskHandle_t coord_task;
     TaskHandle_t wg_mgr_task;
+    /* PSRAM stacks of the static tasks, freed by microlink_stop() after the delete */
+    StackType_t *net_io_task_stack;
+    StackType_t *derp_tx_task_stack;
+    StackType_t *coord_task_stack;
 
     /* Queues */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
@@ -487,6 +524,7 @@ struct microlink_s {
      * leaves a connection alone that completed after the last bump, to the home region. */
     volatile uint32_t derp_target_gen;
     volatile uint16_t derp_failed_region;  /* DERP task: home region whose connects keep failing */
+    volatile uint16_t derp_ok_region;      /* DERP task: region whose connection carried a frame */
 
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */
@@ -595,7 +633,7 @@ void ml_net_io_task(void *arg);
 
 /* ml_derp.c */
 void ml_derp_tx_task(void *arg);
-esp_err_t ml_derp_connect(microlink_t *ml);
+esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region);
 void ml_derp_disconnect(microlink_t *ml);
 esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len);
@@ -622,11 +660,11 @@ bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
 
 esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t server_ip, uint16_t port,
                                 uint8_t txid_out[12]);
-/* Asynchronous IPv4 lookup (lwIP DNS on the tcpip thread). done() runs on that thread
- * with the host name asked for and the address (host order), 0 on failure. */
-esp_err_t ml_stun_resolve_async(const char *host,
-                                void (*done)(void *ctx, const char *host, uint32_t ipv4),
-                                void *ctx);
+/* Resolve a job's names (IPv4). ESP_OK: the job belongs to the resolver until
+ * job->done, then to the caller again; otherwise the caller keeps it. */
+esp_err_t ml_dns_job_start(ml_dns_job_t *job);
+/* The caller gives the job up (never touches it again); it is freed when done. */
+void ml_dns_job_detach(ml_dns_job_t *job);
 
 /* ml_netcheck.c: pure parts (no I/O) */
 bool ml_nc_node_can_stun(const ml_derp_node_t *n);
@@ -643,15 +681,30 @@ uint16_t ml_nc_effective_home(const ml_derp_region_t *regions, int count,
                               uint16_t peer_region, uint16_t latency_home);
 uint32_t ml_derp_backoff_ms(int failures, uint32_t rnd);   /* rnd: uniform 32-bit */
 bool ml_derp_backoff_capped(int failures);
+void ml_derp_retry_on_bits(ml_derp_retry_t *s, bool registered, bool connect_req);
+bool ml_derp_retry_due(const ml_derp_retry_t *s, bool connected, bool registered, uint64_t now_ms);
+void ml_derp_retry_attempt(ml_derp_retry_t *s, uint16_t region);
+bool ml_derp_retry_frame(ml_derp_retry_t *s);              /* true: the first one */
+uint32_t ml_derp_retry_failed(ml_derp_retry_t *s, uint64_t now_ms, uint32_t rnd);
 /* ml_netcheck.c: one measurement round, driven by the coord task */
 bool ml_netcheck_on_derp_map(microlink_t *ml);
 void ml_netcheck_request_full(microlink_t *ml);
 bool ml_netcheck_due(const microlink_t *ml, uint64_t now_ms);
+
+/* A library task stops: it reports through its exit bit and suspends itself;
+ * microlink_stop() deletes it once suspended (no self-delete: a static TCB must
+ * be off every list before it can be reused). */
+static inline void ml_task_exit(microlink_t *ml, EventBits_t exit_bit) {
+    xEventGroupSetBits(ml->events, exit_bit);
+    vTaskSuspend(NULL);
+}
 bool ml_netcheck_begin(microlink_t *ml, int64_t now_us);
 int32_t ml_netcheck_service(microlink_t *ml, int64_t now_us);
 bool ml_netcheck_on_stun(microlink_t *ml, const uint8_t *data, size_t len, int64_t now_us);
 bool ml_netcheck_end(microlink_t *ml, int64_t now_us);     /* true: home changed */
 void ml_netcheck_abort(microlink_t *ml);                   /* shutdown: no side effects */
+void ml_netcheck_release(microlink_t *ml);                 /* coord exit: free, detach DNS */
+void ml_netcheck_forget_derp_failures(microlink_t *ml);    /* rebind: try every region again */
 bool ml_netcheck_apply_home(microlink_t *ml);
 bool ml_netcheck_take_home_change(microlink_t *ml);
 

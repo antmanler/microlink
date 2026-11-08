@@ -87,8 +87,10 @@ static const char *TAG = "microlink";
             stk_##field, &tcb_##field, core);                                           \
         if (ml->field == NULL) {                                                        \
             ESP_LOGE(TAG, "Failed to create %s task", tname);                           \
+            heap_caps_free(stk_##field);                                                \
             return ESP_FAIL;                                                            \
         }                                                                               \
+        ml->field##_stack = stk_##field;  /* freed by microlink_stop() */               \
     } while (0)
 
 
@@ -409,6 +411,12 @@ esp_err_t microlink_start(microlink_t *ml) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* A previous stop left these set; the new tasks must not see them. */
+    xEventGroupClearBits(ml->events, ML_EVT_SHUTDOWN_REQUEST | ML_EVT_EXIT_NET_IO |
+                         ML_EVT_EXIT_DERP | ML_EVT_EXIT_COORD | ML_EVT_EXIT_WG_MGR |
+                         ML_EVT_COORD_REGISTERED | ML_EVT_DERP_CONNECTED |
+                         ML_EVT_DERP_RECONNECT | ML_EVT_DERP_CONNECT_REQ);
+
     ml->state = ML_STATE_WIFI_WAIT;
 
     /* Set WiFi TX power if configured */
@@ -602,8 +610,29 @@ rebind_wg_update:
     return ESP_OK;
 }
 
+/* Delete a task that stopped through ml_task_exit() (it is suspended, or about to
+ * be), then free its PSRAM stack. */
+static void reap_task(TaskHandle_t *task, StackType_t **stack) {
+    if (*task) {
+        while (eTaskGetState(*task) != eSuspended) vTaskDelay(1);
+        vTaskDelete(*task);
+        *task = NULL;
+    }
+    if (stack && *stack) {
+        heap_caps_free(*stack);
+        *stack = NULL;
+    }
+}
+
 esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
+    /* From a library task (state_cb runs on coord) the wait below never ends. */
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    if (self == ml->net_io_task || self == ml->derp_tx_task ||
+        self == ml->coord_task || self == ml->wg_mgr_task) {
+        ESP_LOGE(TAG, "microlink_stop() called from a MicroLink task: refused");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     ESP_LOGI(TAG, "Stopping...");
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
@@ -612,10 +641,14 @@ esp_err_t microlink_stop(microlink_t *ml) {
         ml_rx_packet_t wake = {0};
         xQueueSend(ml->stun_rx_queue, &wake, 0);
     }
+    /* End coord's reconnect backoff wait on its command queue. */
+    if (ml->coord_cmd_queue) {
+        ml_coord_cmd_t wake_cmd = ML_CMD_SHUTDOWN_WAKE;
+        xQueueSend(ml->coord_cmd_queue, &wake_cmd, 0);
+    }
 
     /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST). Each sets its
-     * exit bit right before vTaskDelete(NULL); we must NOT call vTaskDelete() on
-     * them again (crash in uxListRemove), only wait and NULL the handles. Sockets
+     * exit bit and suspends itself (ml_task_exit); then it is deleted here. Sockets
      * and queues are released below, so this waits as long as a task needs. */
     EventBits_t exit_bits = 0;
     if (ml->net_io_task) exit_bits |= ML_EVT_EXIT_NET_IO;
@@ -625,11 +658,10 @@ esp_err_t microlink_stop(microlink_t *ml) {
     if (exit_bits) {
         xEventGroupWaitBits(ml->events, exit_bits, pdFALSE, pdTRUE, portMAX_DELAY);
     }
-
-    ml->net_io_task = NULL;
-    ml->derp_tx_task = NULL;
-    ml->coord_task = NULL;
-    ml->wg_mgr_task = NULL;
+    reap_task(&ml->net_io_task, &ml->net_io_task_stack);
+    reap_task(&ml->derp_tx_task, &ml->derp_tx_task_stack);
+    reap_task(&ml->coord_task, &ml->coord_task_stack);
+    reap_task(&ml->wg_mgr_task, NULL);
 
     /* Stop HTTP config server */
     if (ml->config_httpd) {

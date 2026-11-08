@@ -47,11 +47,15 @@ esp_err_t microlink_set_priority_peer_name(microlink_t *ml, const char *fqdn) {
     }
     portEXIT_CRITICAL(&ml->id_lock);
 
-    /* A peer left out of the table is only known again from a full netmap. */
+    /* A peer left out of the table is only known again from a full netmap. A cleared
+     * name changes the home region at once (no other peer takes its place). */
     microlink_state_t st = ml->state;
     if (changed && len > 0 && ml->coord_cmd_queue &&
         (st == ML_STATE_CONNECTED || st == ML_STATE_NEEDS_MACHINE_AUTH)) {
         ml_coord_cmd_t cmd = ML_CMD_RESYNC_NETMAP;
+        xQueueSend(ml->coord_cmd_queue, &cmd, 0);
+    } else if (changed && len == 0 && ml->coord_cmd_queue) {
+        ml_coord_cmd_t cmd = ML_CMD_PRIORITY_CLEARED;
         xQueueSend(ml->coord_cmd_queue, &cmd, 0);
     }
     return ESP_OK;

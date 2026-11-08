@@ -477,6 +477,19 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
  * Unified DERP I/O Task
  * ========================================================================== */
 
+/* A connect failed, or the connection broke before its first frame: back off. A
+ * region whose wait reached the maximum is reported to netcheck, which leaves it out
+ * of every home choice until a connection to it carries a frame. */
+static void derp_attempt_failed(microlink_t *ml, ml_derp_retry_t *retry) {
+    uint32_t wait_ms = ml_derp_retry_failed(retry, ml_get_time_ms(), esp_random());
+    if (ml_derp_backoff_capped(retry->failures)) {
+        if (ml->derp_ok_region == retry->region) ml->derp_ok_region = 0;
+        ml->derp_failed_region = retry->region;
+    }
+    ESP_LOGW(TAG, "DERP region %u failed (%d in a row), next attempt in %lu ms",
+             retry->region, retry->failures, (unsigned long)wait_ms);
+}
+
 void ml_derp_tx_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "DERP I/O task started (Core %d)", xPortGetCoreID());
@@ -488,11 +501,8 @@ void ml_derp_tx_task(void *arg) {
     uint64_t last_heartbeat_ms = 0;
     uint64_t connected_since_ms = 0;
     bool verbose_phase = false;  /* verbose logging for first 15s after connect */
-    /* Connect retry (magicsock runDerpReader + util/backoff): failures in a row to
-     * one region, and the earliest time of the next attempt. */
-    int connect_failures = 0;
-    uint16_t connect_region = 0;
-    uint64_t next_connect_ms = 0;
+    /* Connect retry (magicsock runDerpReader + util/backoff), ml_netcheck.c. */
+    ml_derp_retry_t retry = {0};
 
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         loop_count++;
@@ -523,10 +533,11 @@ void ml_derp_tx_task(void *arg) {
         {
             EventBits_t bits = xEventGroupGetBits(ml->events);
             if (bits & ML_EVT_DERP_CONNECT_REQ) {
-                /* Coord just registered: try now, whatever the backoff said. */
+                /* Coord registered and decided the home region: try now. */
                 xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
-                next_connect_ms = 0;
             }
+            ml_derp_retry_on_bits(&retry, (bits & ML_EVT_COORD_REGISTERED) != 0,
+                                  (bits & ML_EVT_DERP_CONNECT_REQ) != 0);
             if ((bits & ML_EVT_DERP_RECONNECT) && ml->derp.connected &&
                 ml->derp.target_gen == ml->derp_target_gen &&
                 ml->derp.region == ml->derp_home_region) {
@@ -540,34 +551,20 @@ void ml_derp_tx_task(void *arg) {
                          ml->derp.connected ? "connected" : "disconnected");
                 ml_derp_disconnect(ml);
                 verbose_phase = false;
-                next_connect_ms = 0;        /* reconnected below */
+                retry.awaiting_frame = false;
+                retry.next_ms = 0;          /* reconnected below */
             }
 
-            /* Connect while registered, for as long as it takes. A region whose
-             * backoff reached its maximum is reported to netcheck, which leaves it
-             * out of the latency choice (not the priority peer's choice). */
-            uint64_t now_ms = ml_get_time_ms();
-            if (!ml->derp.connected && (bits & ML_EVT_COORD_REGISTERED) &&
-                now_ms >= next_connect_ms) {
+            /* Connect while registered, for as long as it takes. */
+            if (ml_derp_retry_due(&retry, ml->derp.connected,
+                                  (bits & ML_EVT_COORD_REGISTERED) != 0, ml_get_time_ms())) {
                 uint16_t region = ml->derp_home_region;
-                if (region != connect_region) {
-                    connect_region = region;
-                    connect_failures = 0;
-                }
-                if (ml_derp_connect(ml) == ESP_OK) {
-                    connect_failures = 0;
-                    if (ml->derp_failed_region == region) ml->derp_failed_region = 0;
+                ml_derp_retry_attempt(&retry, region);
+                if (ml_derp_connect(ml, region) == ESP_OK) {
                     connected_since_ms = ml_get_time_ms();
                     verbose_phase = true;
                 } else {
-                    connect_failures++;
-                    uint32_t wait_ms = ml_derp_backoff_ms(connect_failures, esp_random());
-                    next_connect_ms = ml_get_time_ms() + wait_ms;
-                    if (ml_derp_backoff_capped(connect_failures)) {
-                        ml->derp_failed_region = region;
-                    }
-                    ESP_LOGW(TAG, "DERP connect to region %u failed (%d in a row), next in %lu ms",
-                             region, connect_failures, (unsigned long)wait_ms);
+                    derp_attempt_failed(ml, &retry);
                 }
             }
         }
@@ -604,8 +601,8 @@ void ml_derp_tx_task(void *arg) {
                 }
                 if (ret < 0) {
                     ESP_LOGW(TAG, "DERP write failed");
-                    ml->derp.connected = false;
-                    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+                    ml_derp_disconnect(ml);
+                    derp_attempt_failed(ml, &retry);
                 } else {
                     frames_tx++;
                 }
@@ -623,12 +620,17 @@ void ml_derp_tx_task(void *arg) {
                 if (ret > 0) {
                     frames_rx++;
                     ml->derp.last_recv_ms = ml_get_time_ms();
+                    if (ml_derp_retry_frame(&retry)) {
+                        /* The region carries traffic: netcheck may choose it again. */
+                        if (ml->derp_failed_region == retry.region) ml->derp_failed_region = 0;
+                        ml->derp_ok_region = retry.region;
+                    }
                 } else if (ret == 0) {
                     break;  /* No more data / timeout */
                 } else {
                     ESP_LOGW(TAG, "DERP read error: %d", ret);
-                    ml->derp.connected = false;
-                    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+                    ml_derp_disconnect(ml);
+                    derp_attempt_failed(ml, &retry);
                     break;
                 }
             }
@@ -638,21 +640,35 @@ void ml_derp_tx_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
+    ml_derp_disconnect(ml);
     ESP_LOGI(TAG, "DERP I/O task exiting");
-    xEventGroupSetBits(ml->events, ML_EVT_EXIT_DERP);
-    vTaskDelete(NULL);
+    ml_task_exit(ml, ML_EVT_EXIT_DERP);
 }
 
 /* ============================================================================
  * DERP Connection Management (called from coord task)
  * ========================================================================== */
 
-esp_err_t ml_derp_connect(microlink_t *ml) {
-    /* Connect to the home region (measured by ml_netcheck.c), first DERP node of the
+static bool derp_stopping(microlink_t *ml) {
+    return (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) != 0;
+}
+
+/* Failure after the TLS contexts were set up: free them with the socket. */
+static esp_err_t derp_connect_fail(microlink_t *ml, int sock) {
+    mbedtls_ssl_free(&ml->derp.ssl);
+    mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+    mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
+    mbedtls_entropy_free(&ml->derp.entropy);
+    ml_close_sock(sock);
+    ml->derp.sockfd = -1;
+    return ESP_FAIL;
+}
+
+esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region) {
+    /* Connect to `region` (the home region, ml_netcheck.c), first DERP node of the
      * region. Never a region absent from the DERP map: without one, no connection. */
     char derp_host[sizeof(((ml_derp_node_t *)0)->hostname)] = "";   /* copy: coord may re-parse the map */
     int derp_port = ML_DERP_PORT;
-    uint16_t region = ml->derp_home_region;
     /* Taken before connecting: a rebind or region change during the connect makes
      * this connection stale, and a pending reconnect request then replaces it. */
     uint32_t target_gen = ml->derp_target_gen;
@@ -690,6 +706,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         return ESP_FAIL;
     }
 
+    if (derp_stopping(ml)) {
+        ml_freeaddrinfo(res);
+        return ESP_FAIL;
+    }
     int64_t t_derp_dns = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] DERP DNS: %lld ms", (t_derp_dns - t_derp_start) / 1000);
 
@@ -712,6 +732,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         return ESP_FAIL;
     }
     ml_freeaddrinfo(res);
+    if (derp_stopping(ml)) {
+        ml_close_sock(sock);
+        return ESP_FAIL;
+    }
 
     int64_t t_derp_tcp = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] DERP TCP connect: %lld ms", (t_derp_tcp - t_derp_dns) / 1000);
@@ -752,11 +776,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         char err_buf[128];
         mbedtls_strerror(ret, err_buf, sizeof(err_buf));
         ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
-        ml_close_sock(sock);
-        ml->derp.sockfd = -1;
-        return ESP_FAIL;
+        return derp_connect_fail(ml, sock);
     }
 
+    if (derp_stopping(ml)) return derp_connect_fail(ml, sock);
     int64_t t_derp_tls = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] DERP TLS handshake: %lld ms", (t_derp_tls - t_derp_tcp) / 1000);
     ESP_LOGI(TAG, "TLS connected to DERP");
@@ -774,9 +797,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     ret = mbedtls_ssl_write(&ml->derp.ssl, (const uint8_t *)upgrade_req, strlen(upgrade_req));
     if (ret < 0) {
         ESP_LOGE(TAG, "Failed to send HTTP upgrade");
-        ml_close_sock(sock);
-        ml->derp.sockfd = -1;
-        return ESP_FAIL;
+        return derp_connect_fail(ml, sock);
     }
 
     /* Read HTTP response byte-by-byte until \r\n\r\n to avoid over-reading
@@ -788,11 +809,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         uint64_t http_start = ml_get_time_ms();
 
         while (resp_len < (int)sizeof(resp_buf) - 1) {
+            if (derp_stopping(ml)) return derp_connect_fail(ml, sock);
             if (ml_get_time_ms() - http_start > DERP_CONNECT_TIMEOUT_MS) {
                 ESP_LOGE(TAG, "HTTP upgrade response timeout");
-                ml_close_sock(sock);
-                ml->derp.sockfd = -1;
-                return ESP_FAIL;
+                return derp_connect_fail(ml, sock);
             }
 
             ret = mbedtls_ssl_read(&ml->derp.ssl, resp_buf + resp_len, 1);
@@ -803,15 +823,11 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                     continue;
                 }
                 ESP_LOGE(TAG, "HTTP upgrade read failed: -0x%04x", -ret);
-                ml_close_sock(sock);
-                ml->derp.sockfd = -1;
-                return ESP_FAIL;
+                return derp_connect_fail(ml, sock);
             }
             if (ret == 0) {
                 ESP_LOGE(TAG, "Connection closed during HTTP upgrade");
-                ml_close_sock(sock);
-                ml->derp.sockfd = -1;
-                return ESP_FAIL;
+                return derp_connect_fail(ml, sock);
             }
             resp_len++;
 
@@ -828,9 +844,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
 
         if (!found_end || strstr((char *)resp_buf, "101") == NULL) {
             ESP_LOGE(TAG, "DERP upgrade rejected: %.100s", resp_buf);
-            ml_close_sock(sock);
-            ml->derp.sockfd = -1;
-            return ESP_FAIL;
+            return derp_connect_fail(ml, sock);
         }
         ESP_LOGI(TAG, "HTTP 101 Switching Protocols received");
     }
@@ -859,17 +873,13 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     esp_err_t err = derp_recv_frame_header(ml, &frame_type, &frame_len, DERP_CONNECT_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read ServerKey frame header (err=%d)", err);
-        ml_close_sock(sock);
-        ml->derp.sockfd = -1;
-        return ESP_FAIL;
+        return derp_connect_fail(ml, sock);
     }
 
     if (frame_type != DERP_FRAME_SERVER_KEY || frame_len < 40) {
         ESP_LOGE(TAG, "Expected ServerKey frame (0x01), got 0x%02x len=%lu",
                  frame_type, (unsigned long)frame_len);
-        ml_close_sock(sock);
-        ml->derp.sockfd = -1;
-        return ESP_FAIL;
+        return derp_connect_fail(ml, sock);
     }
 
     /* Read and verify 8-byte magic */
@@ -877,18 +887,14 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     static const uint8_t DERP_MAGIC[8] = {0x44, 0x45, 0x52, 0x50, 0xf0, 0x9f, 0x94, 0x91};
     if (derp_tls_read_all(ml, magic, 8, DERP_CONNECT_TIMEOUT_MS) < 0) {
         ESP_LOGE(TAG, "Failed to read ServerKey magic");
-        ml_close_sock(sock);
-        ml->derp.sockfd = -1;
-        return ESP_FAIL;
+        return derp_connect_fail(ml, sock);
     }
 
     if (memcmp(magic, DERP_MAGIC, 8) != 0) {
         ESP_LOGE(TAG, "Invalid DERP magic: %02x%02x%02x%02x%02x%02x%02x%02x",
                  magic[0], magic[1], magic[2], magic[3],
                  magic[4], magic[5], magic[6], magic[7]);
-        ml_close_sock(sock);
-        ml->derp.sockfd = -1;
-        return ESP_FAIL;
+        return derp_connect_fail(ml, sock);
     }
     ESP_LOGI(TAG, "DERP magic verified");
 
@@ -896,9 +902,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     uint8_t derp_server_key[32];
     if (derp_tls_read_all(ml, derp_server_key, 32, DERP_CONNECT_TIMEOUT_MS) < 0) {
         ESP_LOGE(TAG, "Failed to read server key");
-        ml_close_sock(sock);
-        ml->derp.sockfd = -1;
-        return ESP_FAIL;
+        return derp_connect_fail(ml, sock);
     }
 
     ESP_LOGI(TAG, "DERP server key received (first 8): %02x%02x%02x%02x%02x%02x%02x%02x",
@@ -930,9 +934,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         size_t ciphertext_len = json_len + NACL_BOX_MACBYTES;
         uint8_t *ciphertext = malloc(ciphertext_len);
         if (!ciphertext) {
-            ml_close_sock(sock);
-            ml->derp.sockfd = -1;
-            return ESP_FAIL;
+            return derp_connect_fail(ml, sock);
         }
 
         if (nacl_box(ciphertext,
@@ -943,9 +945,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                      ) != 0) {
             ESP_LOGE(TAG, "NaCl box encrypt failed");
             free(ciphertext);
-            ml_close_sock(sock);
-            ml->derp.sockfd = -1;
-            return ESP_FAIL;
+            return derp_connect_fail(ml, sock);
         }
 
         /* Build ClientInfo frame payload: nodekey(32) + nonce(24) + ciphertext */
@@ -953,9 +953,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         uint8_t *ci_payload = malloc(ci_payload_len);
         if (!ci_payload) {
             free(ciphertext);
-            ml_close_sock(sock);
-            ml->derp.sockfd = -1;
-            return ESP_FAIL;
+            return derp_connect_fail(ml, sock);
         }
 
         memcpy(ci_payload, ml->wg_public_key, 32);
@@ -969,9 +967,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         if (derp_write_frame(ml, DERP_FRAME_CLIENT_INFO, ci_payload, ci_payload_len) < 0) {
             ESP_LOGE(TAG, "Failed to send ClientInfo");
             free(ci_payload);
-            ml_close_sock(sock);
-            ml->derp.sockfd = -1;
-            return ESP_FAIL;
+            return derp_connect_fail(ml, sock);
         }
         free(ci_payload);
 

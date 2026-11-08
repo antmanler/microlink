@@ -110,20 +110,21 @@ esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t ip, uint16_t port, uint
     return ESP_OK;
 }
 
-/* DERP node name lookups (ml_netcheck.c): kept pending until a test answers. */
-int stub_dns_count;
-char stub_dns_host[16][64];
-void (*stub_dns_done[16])(void *ctx, const char *host, uint32_t ipv4);
-void *stub_dns_ctx[16];
-esp_err_t ml_stun_resolve_async(const char *host,
-                                void (*done)(void *ctx, const char *host, uint32_t ipv4),
-                                void *ctx) {
-    if (stub_dns_count >= 16) return ESP_FAIL;
-    snprintf(stub_dns_host[stub_dns_count], sizeof(stub_dns_host[0]), "%s", host);
-    stub_dns_done[stub_dns_count] = done;
-    stub_dns_ctx[stub_dns_count] = ctx;
-    stub_dns_count++;
+/* DERP node name lookups (ml_netcheck.c): the test answers stub_dns_job itself. */
+ml_dns_job_t *stub_dns_job;
+int stub_dns_starts, stub_dns_detached;
+esp_err_t stub_dns_start_result = ESP_OK;
+esp_err_t ml_dns_job_start(ml_dns_job_t *job) {
+    stub_dns_starts++;
+    if (stub_dns_start_result != ESP_OK) return stub_dns_start_result;
+    stub_dns_job = job;
     return ESP_OK;
+}
+void ml_dns_job_detach(ml_dns_job_t *job) {
+    if (!job) return;
+    stub_dns_detached++;
+    if (job == stub_dns_job) stub_dns_job = NULL;
+    free(job);
 }
 
 /* STUN is not part of the registration path. */

@@ -197,8 +197,14 @@ uint16_t ml_nc_pick_home(const ml_derp_region_t *regions, int count, const uint3
 uint16_t ml_nc_effective_home(const ml_derp_region_t *regions, int count,
                               uint16_t peer_region, uint16_t latency_home) {
     /* We hold one DERP connection and send everything through our own home region,
-     * so the priority peer is reachable over DERP only when our home is its home. */
-    if (region_index(regions, count, peer_region) >= 0) return peer_region;
+     * so the priority peer is reachable over DERP only when our home is its home:
+     * its region wins whenever we can use it (a DERP node, connects not failing). */
+    int pi = region_index(regions, count, peer_region);
+    if (pi < 0 || regions[pi].derp_failed) return latency_home;
+    for (int i = 0; i < regions[pi].node_count; i++) {
+        const ml_derp_node_t *n = &regions[pi].nodes[i];
+        if (!n->stun_only && n->hostname[0]) return peer_region;
+    }
     return latency_home;
 }
 
@@ -212,6 +218,45 @@ uint32_t ml_derp_backoff_ms(int failures, uint32_t rnd) {
 
 bool ml_derp_backoff_capped(int failures) {
     return (uint64_t)failures * (uint64_t)failures * ML_DERP_BACKOFF_STEP_MS >= ML_DERP_BACKOFF_MAX_MS;
+}
+
+/* The DERP task connects only while registered and after coord asked for it (the
+ * home region is decided by then); a lost registration needs a new request. */
+void ml_derp_retry_on_bits(ml_derp_retry_t *s, bool registered, bool connect_req) {
+    if (!registered) s->home_decided = false;
+    if (connect_req) {
+        if (registered) s->home_decided = true;
+        s->next_ms = 0;
+    }
+}
+
+bool ml_derp_retry_due(const ml_derp_retry_t *s, bool connected, bool registered, uint64_t now_ms) {
+    return !connected && registered && s->home_decided && now_ms >= s->next_ms;
+}
+
+void ml_derp_retry_attempt(ml_derp_retry_t *s, uint16_t region) {
+    if (region != s->region) {
+        s->region = region;
+        s->failures = 0;
+    }
+    s->awaiting_frame = true;       /* until a frame is read, it is not a success */
+}
+
+/* magicsock runDerpReader resets its backoff only after a successful read. */
+bool ml_derp_retry_frame(ml_derp_retry_t *s) {
+    if (!s->awaiting_frame) return false;
+    s->awaiting_frame = false;
+    s->failures = 0;
+    return true;
+}
+
+/* A failed connect, or a connection lost before its first frame. Returns the wait. */
+uint32_t ml_derp_retry_failed(ml_derp_retry_t *s, uint64_t now_ms, uint32_t rnd) {
+    s->awaiting_frame = false;
+    s->failures++;
+    uint32_t wait = ml_derp_backoff_ms(s->failures, rnd);
+    s->next_ms = now_ms + wait;
+    return wait;
 }
 
 /* ============================================================================
@@ -260,25 +305,15 @@ bool ml_netcheck_due(const microlink_t *ml, uint64_t now_ms) {
     const ml_netcheck_t *nc = &ml->netcheck;
     if (ml->derp_region_count == 0) return false;
     if (nc->next_full || !nc->ran) return true;
+    if (nc->dns_job && nc->dns_job->done) return true;     /* new addresses to measure */
     return now_ms - nc->last_round_ms >= ml->t_stun_interval_ms;
-}
-
-/* Runs on the tcpip thread. The node is matched by name: the map may have been
- * re-parsed since the lookup started. */
-static void dns_done(void *ctx, const char *host, uint32_t ipv4) {
-    ml_derp_node_t *n = (ml_derp_node_t *)ctx;
-    if (strcmp(n->hostname, host) == 0) {
-        if (ipv4) n->stun_ipv4 = ipv4;
-        else n->stun_dns_failed = true;            /* retried with the next map */
-    }
-    n->stun_dns_pending = false;
 }
 
 /* A literal IPv4 is used as is; anything else that is not empty disables IPv4
  * (tailcfg.DERPNode.IPv4, "none" by convention); empty means look up the host name.
- * Lookups never block the coord task: the node is probed once its address is in. */
-static void resolve_node(ml_derp_node_t *n) {
-    if (n->stun_ipv4 != 0 || n->stun_port < 0 || n->stun_dns_failed || n->stun_dns_pending) return;
+ * Returns true when the node still needs that lookup. */
+static bool resolve_literal(ml_derp_node_t *n) {
+    if (n->stun_ipv4 != 0 || n->stun_port < 0 || n->stun_dns_failed) return false;
     unsigned a, b, c, d;
     char extra;
     if (n->ipv4[0]) {
@@ -286,14 +321,62 @@ static void resolve_node(ml_derp_node_t *n) {
             a <= 255 && b <= 255 && c <= 255 && d <= 255) {
             n->stun_ipv4 = (a << 24) | (b << 16) | (c << 8) | d;
         }
+        return false;
+    }
+    return n->hostname[0] != '\0';
+}
+
+/* Results of a finished lookup job, matched by name (the map may have been re-parsed
+ * meanwhile). A name that did not resolve is not looked up again until the next map;
+ * a local error is retried with the next round. */
+static void dns_harvest(microlink_t *ml) {
+    ml_dns_job_t *job = ml->netcheck.dns_job;
+    if (!job || !job->done) return;
+    for (int k = 0; k < job->count; k++) {
+        const ml_dns_item_t *it = &job->items[k];
+        for (int i = 0; i < ml->derp_region_count; i++) {
+            ml_derp_region_t *r = &ml->derp_regions[i];
+            for (int j = 0; j < r->node_count; j++) {
+                ml_derp_node_t *n = &r->nodes[j];
+                if (n->ipv4[0] || n->stun_ipv4 || strcmp(n->hostname, it->host) != 0) continue;
+                if (it->status == ML_DNS_OK) n->stun_ipv4 = it->ipv4;
+                else if (it->status == ML_DNS_FAILED) n->stun_dns_failed = true;
+            }
+        }
+    }
+    free(job);
+    ml->netcheck.dns_job = NULL;
+}
+
+/* One job for every name still unresolved; its end requests a round (due()). */
+static void dns_request(microlink_t *ml) {
+    ml_netcheck_t *nc = &ml->netcheck;
+    if (nc->dns_job) return;                       /* one batch at a time */
+    const char *names[ML_MAX_DERP_REGIONS * ML_MAX_DERP_NODES];
+    int count = 0;
+    for (int i = 0; i < ml->derp_region_count; i++) {
+        ml_derp_region_t *r = &ml->derp_regions[i];
+        if (region_skipped(r)) continue;
+        for (int j = 0; j < r->node_count; j++) {
+            if (!resolve_literal(&r->nodes[j])) continue;
+            bool dup = false;
+            for (int k = 0; k < count && !dup; k++) dup = !strcmp(names[k], r->nodes[j].hostname);
+            if (!dup) names[count++] = r->nodes[j].hostname;
+        }
+    }
+    if (count == 0) return;
+    ml_dns_job_t *job = calloc(1, sizeof(*job) + (size_t)count * sizeof(ml_dns_item_t));
+    if (!job) return;                              /* next round */
+    job->count = count;
+    for (int k = 0; k < count; k++) {
+        strncpy(job->items[k].host, names[k], sizeof(job->items[k].host) - 1);
+    }
+    if (ml_dns_job_start(job) != ESP_OK) {
+        free(job);                                 /* next round */
         return;
     }
-    if (!n->hostname[0]) return;
-    n->stun_dns_pending = true;
-    if (ml_stun_resolve_async(n->hostname, dns_done, n) != ESP_OK) {
-        n->stun_dns_pending = false;
-        n->stun_dns_failed = true;
-    }
+    nc->dns_job = job;
+    dns_harvest(ml);                               /* a synchronous resolver is done */
 }
 
 bool ml_netcheck_begin(microlink_t *ml, int64_t now_us) {
@@ -308,18 +391,10 @@ bool ml_netcheck_begin(microlink_t *ml, int64_t now_us) {
     nc->next_full = false;
     nc->last_round_ms = now_ms;
     nc->ran = true;
-    if (full) {
-        nc->last_full_ms = now_ms;
-        /* A full round gives regions whose DERP connects failed another chance. */
-        for (int i = 0; i < ml->derp_region_count; i++) ml->derp_regions[i].derp_failed = false;
-        ml->derp_failed_region = 0;
-    }
+    if (full) nc->last_full_ms = now_ms;
 
-    for (int i = 0; i < ml->derp_region_count; i++) {
-        ml_derp_region_t *r = &ml->derp_regions[i];
-        if (region_skipped(r)) continue;
-        for (int j = 0; j < r->node_count; j++) resolve_node(&r->nodes[j]);
-    }
+    dns_harvest(ml);
+    dns_request(ml);
 
     nc->probes = ml_psram_calloc(ML_NC_MAX_PROBES, sizeof(ml_nc_probe_t));
     if (!nc->probes) return false;
@@ -397,6 +472,17 @@ void ml_netcheck_abort(microlink_t *ml) {
     memset(ml->netcheck.lat_us, 0, sizeof(ml->netcheck.lat_us));
 }
 
+void ml_netcheck_release(microlink_t *ml) {
+    ml_netcheck_abort(ml);
+    ml_dns_job_detach(ml->netcheck.dns_job);
+    ml->netcheck.dns_job = NULL;
+}
+
+void ml_netcheck_forget_derp_failures(microlink_t *ml) {
+    for (int i = 0; i < ml->derp_region_count; i++) ml->derp_regions[i].derp_failed = false;
+    ml->derp_failed_region = 0;
+}
+
 bool ml_netcheck_end(microlink_t *ml, int64_t now_us) {
     ml_netcheck_t *nc = &ml->netcheck;
     uint64_t now_ms = (uint64_t)(now_us / 1000);
@@ -412,11 +498,18 @@ bool ml_netcheck_end(microlink_t *ml, int64_t now_us) {
                  (unsigned long)nc->lat_us[i]);
     }
 
-    /* A region the DERP task cannot connect to is not a latency choice. */
+    /* A region the DERP task cannot connect to is no home choice until a connection
+     * to it carries a frame, or a rebind. tailscaled has no such rule (it keeps
+     * retrying its home); without it a region with good STUN but no DERP reach is
+     * chosen again every round. */
     uint16_t failed = ml->derp_failed_region;
-    for (int i = 0; failed && i < ml->derp_region_count; i++) {
-        if (ml->derp_regions[i].region_id == failed) ml->derp_regions[i].derp_failed = true;
+    uint16_t ok = ml->derp_ok_region;
+    for (int i = 0; i < ml->derp_region_count; i++) {
+        ml_derp_region_t *r = &ml->derp_regions[i];
+        if (failed && r->region_id == failed) r->derp_failed = true;
+        if (ok && r->region_id == ok) r->derp_failed = false;
     }
+    if (ok && ml->derp_ok_region == ok) ml->derp_ok_region = 0;
 
     /* The old choice still counts as reachable when its DERP connection carried a
      * frame recently (PreferredDERPFrameTime). */

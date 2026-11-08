@@ -40,6 +40,7 @@ typedef struct { int unused; } portMUX_TYPE;
 
 static inline void vTaskDelay(TickType_t ms) { usleep(ms * 1000u); }
 static inline void vTaskDelete(TaskHandle_t t) { (void)t; }
+static inline void vTaskSuspend(TaskHandle_t t) { (void)t; }
 static inline int xPortGetCoreID(void) { return 0; }
 /* Bits set on any event group are recorded for the tests; reads return
  * shim_event_bits_get, which a test sets (host_stubs.c). */

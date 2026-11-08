@@ -1032,10 +1032,12 @@ static void coord_fail(microlink_t *ml, ml_noise_state_t *noise, coord_state_t *
  * ========================================================================== */
 
 /* Priority peer bookkeeping for the home region (ml_netcheck_apply_home). */
-static void track_priority_peer(microlink_t *ml, const uint8_t key[32], uint16_t region) {
+static void track_priority_peer(microlink_t *ml, const uint8_t key[32], uint32_t vpn_ip,
+                                uint16_t region) {
     ml_netcheck_t *nc = &ml->netcheck;
     memcpy(nc->peer_key, key, 32);
     nc->peer_key_valid = true;
+    nc->peer_ip = vpn_ip;
     nc->peer_region = region;
 }
 
@@ -1045,6 +1047,7 @@ static bool is_tracked_peer(const microlink_t *ml, const uint8_t key[32]) {
 
 static void forget_priority_peer(microlink_t *ml) {
     ml->netcheck.peer_key_valid = false;
+    ml->netcheck.peer_ip = 0;
     ml->netcheck.peer_region = 0;
 }
 
@@ -1170,7 +1173,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         bool is_priority = update->priority ||
             (ml->config.priority_peer_ip != 0 && update->vpn_ip == ml->config.priority_peer_ip);
         if (is_priority) {
-            track_priority_peer(ml, update->public_key, update->derp_region);
+            track_priority_peer(ml, update->public_key, update->vpn_ip, update->derp_region);
             priority_seen = true;
         } else if (is_tracked_peer(ml, update->public_key)) {
             forget_priority_peer(ml);       /* renamed, or the priority name changed */
@@ -1402,6 +1405,10 @@ static void parse_derp_map(microlink_t *ml, cJSON *map_json) {
                 cJSON *avoid = cJSON_GetObjectItem(region_obj, "Avoid");
                 if (avoid && cJSON_IsTrue(avoid)) r->avoid = true;
                 r->no_measure = cJSON_IsTrue(cJSON_GetObjectItem(region_obj, "NoMeasureNoHome"));
+                /* A region whose DERP connects failed stays excluded across maps. */
+                for (int k = 0; old && k < old_count; k++) {
+                    if (old[k].region_id == r->region_id) r->derp_failed = old[k].derp_failed;
+                }
 
                 /* Parse nodes */
                 cJSON *nodes = cJSON_GetObjectItem(region_obj, "Nodes");
@@ -2456,6 +2463,7 @@ static void coord_handle_command(microlink_t *ml, coord_state_t *state, ml_coord
         ml->stun_nat_checked = false;
         ml->nat_mapping_varies = false;
         ml_netcheck_request_full(ml);
+        ml_netcheck_forget_derp_failures(ml);   /* the new network may reach them */
         if (*state != COORD_FAILED) *state = COORD_RECONNECTING;
         break;
     case ML_CMD_FORCE_RECONNECT:
@@ -2475,6 +2483,17 @@ static void coord_handle_command(microlink_t *ml, coord_state_t *state, ml_coord
          * FETCH_PEERS reads after a reconnect. Other states read one anyway. */
         if (*state == COORD_LONG_POLL) *state = COORD_RECONNECTING;
         break;
+    case ML_CMD_PRIORITY_CLEARED:
+        /* The tracked peer stays only when CONFIG_ML_PRIORITY_PEER_IP still names it;
+         * the main loop acts on the home change (ml_netcheck_take_home_change). */
+        if (ml->config.priority_peer_ip == 0 ||
+            ml->netcheck.peer_ip != ml->config.priority_peer_ip) {
+            forget_priority_peer(ml);
+        }
+        ml_netcheck_apply_home(ml);
+        break;
+    case ML_CMD_SHUTDOWN_WAKE:
+        break;                      /* the loop condition sees ML_EVT_SHUTDOWN_REQUEST */
     }
 }
 
@@ -2510,8 +2529,7 @@ void ml_coord_task(void *arg) {
                              pdFALSE, pdFALSE, portMAX_DELAY);
         if (wb & ML_EVT_SHUTDOWN_REQUEST) {
             ESP_LOGI(TAG, "Shutdown requested before WiFi, exiting");
-            xEventGroupSetBits(ml->events, ML_EVT_EXIT_COORD);
-            vTaskDelete(NULL);
+            ml_task_exit(ml, ML_EVT_EXIT_COORD);
             return;
         }
     }
@@ -2837,9 +2855,11 @@ void ml_coord_task(void *arg) {
             /* The priority peer's region, taken from the peers just parsed. */
             if (ml_netcheck_take_home_change(ml)) coord_home_changed(ml, &noise, false);
 
-            /* Signal DERP I/O task to connect (connection now owned by I/O task) */
+            /* The home region is decided: the DERP task may connect now (it never
+             * connects on registration alone, only to replace that connection after
+             * the round). */
+            xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
             if (!ml->derp.connected) {
-                xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
                 /* Wait for DERP to connect (up to 15s) before continuing */
                 ESP_LOGI(TAG, "Waiting for DERP I/O task to connect...");
                 EventBits_t db = xEventGroupWaitBits(ml->events,
@@ -3024,8 +3044,6 @@ void ml_coord_task(void *arg) {
                 int poll_ret = poll_map_update(ml, &noise, &map_unparsed);
                 if (poll_ret > 0) {
                     last_activity_ms = now;  /* Reset watchdog */
-                    /* The priority peer moved, or the DERP map changed under us. */
-                    if (ml_netcheck_take_home_change(ml)) coord_home_changed(ml, &noise, true);
                 } else if (poll_ret < 0) {
                     ESP_LOGW(TAG, "Long-poll connection lost");
                     state = COORD_RECONNECTING;
@@ -3046,6 +3064,9 @@ void ml_coord_task(void *arg) {
                     state = COORD_STUN_PROBE;
                     break;
                 }
+
+                /* The priority peer moved or was cleared, or the DERP map changed. */
+                if (ml_netcheck_take_home_change(ml)) coord_home_changed(ml, &noise, true);
 
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
@@ -3068,6 +3089,7 @@ void ml_coord_task(void *arg) {
                      * endpoint); DISCONNECT leaves for IDLE. */
                     coord_handle_command(ml, &state, wake_cmd);
                     if (state != COORD_RECONNECTING) break;
+                    if (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) break;
                 }
 
                 reconnect_attempts++;
@@ -3095,7 +3117,7 @@ void ml_coord_task(void *arg) {
     }
     memset(&noise, 0, sizeof(noise));
 
+    ml_netcheck_release(ml);        /* round buffers; DNS work is detached */
     ESP_LOGI(TAG, "Coord task exiting");
-    xEventGroupSetBits(ml->events, ML_EVT_EXIT_COORD);
-    vTaskDelete(NULL);
+    ml_task_exit(ml, ML_EVT_EXIT_COORD);
 }

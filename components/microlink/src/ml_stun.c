@@ -21,6 +21,7 @@
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 #include "lwip/tcpip.h"
+#include "lwip/priv/tcpip_priv.h"
 #include <string.h>
 #include <errno.h>
 
@@ -377,46 +378,105 @@ esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t server_ip, uint16_t por
 }
 
 /* ============================================================================
- * Asynchronous lookup for DERP node names (ml_netcheck.c): lwIP DNS on the tcpip
- * thread, so the coord task never blocks in getaddrinfo.
+ * DERP node name lookups (ml_netcheck.c): lwIP DNS on the tcpip thread, one name at
+ * a time (each lookup holds an entry of lwIP's small DNS table, shared with every
+ * getaddrinfo), so the coord task never blocks and other lookups are not starved.
+ * Job fields other than `done` and `items` are touched on the tcpip thread only.
  * ========================================================================== */
 
-typedef struct {
-    void (*done)(void *ctx, const char *host, uint32_t ipv4);
-    void *ctx;
-    char host[sizeof(((ml_derp_node_t *)0)->hostname)];
-} dns_req_t;
+static void dns_job_step(ml_dns_job_t *job);
 
-static void dns_found(const char *name, const ip_addr_t *ip, void *arg) {
-    dns_req_t *r = (dns_req_t *)arg;
-    uint32_t v4 = (ip && IP_IS_V4(ip)) ? ntohl(ip4_addr_get_u32(ip_2_ip4(ip))) : 0;
-    r->done(r->ctx, r->host, v4);
-    free(r);
-}
-
-static void dns_start(void *arg) {
-    dns_req_t *r = (dns_req_t *)arg;
-    ip_addr_t ip;
-    err_t e = dns_gethostbyname_addrtype(r->host, &ip, dns_found, r, LWIP_DNS_ADDRTYPE_IPV4);
-    if (e == ERR_OK) dns_found(r->host, &ip, r);
-    else if (e != ERR_INPROGRESS) dns_found(r->host, NULL, r);
-}
-
-esp_err_t ml_stun_resolve_async(const char *host,
-                                void (*done)(void *ctx, const char *host, uint32_t ipv4),
-                                void *ctx) {
-    /* The AT-command cellular bridge has no lwIP DNS: no lookup there. */
-    if (ml_at_socket_is_ready()) return ESP_ERR_NOT_SUPPORTED;
-    dns_req_t *r = calloc(1, sizeof(*r));
-    if (!r) return ESP_ERR_NO_MEM;
-    r->done = done;
-    r->ctx = ctx;
-    strncpy(r->host, host, sizeof(r->host) - 1);
-    if (tcpip_callback(dns_start, r) != ERR_OK) {
-        free(r);
-        return ESP_FAIL;
+static void dns_job_found(const char *name, const ip_addr_t *ip, void *arg) {
+    (void)name;
+    ml_dns_job_t *job = (ml_dns_job_t *)arg;
+    ml_dns_item_t *it = &job->items[job->next];
+    if (ip && IP_IS_V4(ip)) {
+        it->ipv4 = ntohl(ip4_addr_get_u32(ip_2_ip4(ip)));
+        it->status = ML_DNS_OK;
+    } else {
+        it->status = ML_DNS_FAILED;     /* no answer for the name */
     }
-    return ESP_OK;
+    job->next++;
+    if (!job->stepping) dns_job_step(job);
+}
+
+static void dns_job_step(ml_dns_job_t *job) {
+    job->stepping = true;
+    while (job->next < job->count && !job->detached) {
+        int idx = job->next;
+        ml_dns_item_t *it = &job->items[idx];
+        ip_addr_t ip;
+        err_t e = dns_gethostbyname_addrtype(it->host, &ip, dns_job_found, job,
+                                             LWIP_DNS_ADDRTYPE_IPV4);
+        if (e == ERR_INPROGRESS) {
+            if (job->next == idx) {         /* the answer comes in dns_job_found() */
+                job->stepping = false;
+                return;
+            }
+            continue;
+        }
+        if (e == ERR_OK && IP_IS_V4(&ip)) {
+            it->ipv4 = ntohl(ip4_addr_get_u32(ip_2_ip4(&ip)));
+            it->status = ML_DNS_OK;
+        } else {
+            it->status = ML_DNS_RETRY;      /* ERR_MEM (table full), no server: local */
+        }
+        job->next++;
+    }
+    job->stepping = false;
+    if (job->detached) free(job);
+    else job->done = true;
+}
+
+static void dns_job_begin(void *arg) {
+    dns_job_step((ml_dns_job_t *)arg);
+}
+
+esp_err_t ml_dns_job_start(ml_dns_job_t *job) {
+    if (ml_at_socket_is_ready()) {
+        /* The AT-command cellular bridge has no lwIP DNS: its own resolver, blocking
+         * as before (ml_at_getaddrinfo). */
+        for (int i = 0; i < job->count; i++) {
+            ml_dns_item_t *it = &job->items[i];
+            struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
+            struct addrinfo *res = NULL;
+            it->status = ML_DNS_FAILED;
+            if (ml_getaddrinfo(it->host, NULL, &hints, &res) == 0 && res) {
+                if (res->ai_family == AF_INET) {
+                    it->ipv4 = ntohl(((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr);
+                    it->status = ML_DNS_OK;
+                }
+            }
+            if (res) ml_freeaddrinfo(res);
+        }
+        job->done = true;
+        return ESP_OK;
+    }
+    return tcpip_callback(dns_job_begin, job) == ERR_OK ? ESP_OK : ESP_FAIL;
+}
+
+struct dns_detach_call {
+    struct tcpip_api_call_data base;
+    ml_dns_job_t *job;
+};
+
+/* tcpip thread: a finished job is freed now; otherwise a step or a lookup answer is
+ * still due on this thread, and it frees the job. */
+static err_t dns_detach_fn(struct tcpip_api_call_data *call) {
+    ml_dns_job_t *job = ((struct dns_detach_call *)call)->job;
+    if (job->done) free(job);
+    else job->detached = true;
+    return ERR_OK;
+}
+
+void ml_dns_job_detach(ml_dns_job_t *job) {
+    if (!job) return;
+    if (job->done) {                        /* nothing is due on the tcpip thread */
+        free(job);
+        return;
+    }
+    struct dns_detach_call call = { .job = job };
+    tcpip_api_call(dns_detach_fn, &call.base);
 }
 
 /* ============================================================================
