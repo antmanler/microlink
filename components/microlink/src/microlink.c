@@ -672,6 +672,10 @@ esp_err_t microlink_stop(microlink_t *ml) {
     reap_task(&ml->coord_task, &ml->coord_task_stack);
     reap_task(&ml->wg_mgr_task, NULL);
 
+    /* Updates wg_mgr never took belong to this session; the next one starts from
+     * a full netmap. Freed here, so the list does not grow across stop and start. */
+    ml_peer_updates_flush(ml);
+
     /* Stop HTTP config server */
     if (ml->config_httpd) {
         ml_config_httpd_stop(ml->config_httpd);
@@ -715,7 +719,7 @@ esp_err_t microlink_destroy(microlink_t *ml) {
     if (ml->wg_rx_queue) vQueueDelete(ml->wg_rx_queue);
     if (ml->stun_rx_queue) vQueueDelete(ml->stun_rx_queue);
     if (ml->coord_cmd_queue) vQueueDelete(ml->coord_cmd_queue);
-    ml_peer_updates_deinit(ml);   /* the tasks are gone: free what wg_mgr never took */
+    /* Pending peer updates were freed by microlink_stop() above. */
 
     /* Delete event group */
     if (ml->events) vEventGroupDelete(ml->events);

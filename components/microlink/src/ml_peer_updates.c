@@ -47,7 +47,9 @@ ml_peer_update_t *ml_peer_updates_take_all(microlink_t *ml) {
     return head;
 }
 
-void ml_peer_updates_deinit(microlink_t *ml) {
+/* Frees what the consumer never took. Used when the session ends: the next one
+ * starts with a full netmap, so these updates are stale. */
+void ml_peer_updates_flush(microlink_t *ml) {
     ml_peer_update_t *update = ml_peer_updates_take_all(ml);
     while (update) {
         ml_peer_update_t *next = update->next;

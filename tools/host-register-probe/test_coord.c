@@ -723,7 +723,7 @@ static void test_priority_marked_on_every_netmap(void) {
 
     parse_netmap(ml, "{}");
     free_updates();
-    ml_peer_updates_deinit(ml);
+    ml_peer_updates_flush(ml);
     free(ml);
 }
 
@@ -790,7 +790,7 @@ static void test_netmap_never_drops_updates(void) {
     CHECK(ml_peer_updates_take_all(ml) == NULL);
 
     free_updates();
-    ml_peer_updates_deinit(ml);
+    ml_peer_updates_flush(ml);
     free(json);
     free(ml);
 }

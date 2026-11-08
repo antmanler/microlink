@@ -790,7 +790,7 @@ int ml_peer_admit_slot(const ml_peer_t *peers, int max, bool incoming_priority, 
 void ml_peer_updates_init(microlink_t *ml);
 void ml_peer_updates_push(microlink_t *ml, ml_peer_update_t *update);   /* takes ownership */
 ml_peer_update_t *ml_peer_updates_take_all(microlink_t *ml);   /* oldest first, linked by next; the caller frees each */
-void ml_peer_updates_deinit(microlink_t *ml);                  /* frees every update still pending */
+void ml_peer_updates_flush(microlink_t *ml);                   /* frees every update still pending; the list stays usable */
 
 /* Utility */
 uint64_t ml_get_time_ms(void);

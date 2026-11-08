@@ -94,25 +94,34 @@ static void test_burst_before_any_consumer(void) {
     free(ml);
 }
 
-/* Destroy with updates wg_mgr never took: all are freed, and the list stays usable. */
-static void test_deinit_frees_pending(void) {
+/* Stop with updates wg_mgr never took: all are freed, and the list stays usable for the
+ * next start, which sees only its own updates. */
+static void test_flush_frees_pending(void) {
     microlink_t *ml = new_ml();
-    ml_peer_updates_deinit(ml);                             /* nothing pending: harmless */
+    ml_peer_updates_flush(ml);                              /* nothing pending: harmless */
     CHECK(g_live == 0);
 
     for (uint32_t i = 0; i < 200; i++) ml_peer_updates_push(ml, new_update(i));
     CHECK(g_live == 200);
-    ml_peer_updates_deinit(ml);
+    ml_peer_updates_flush(ml);
     CHECK(g_live == 0);
     CHECK(ml->peer_updates_head == NULL && ml->peer_updates_tail == NULL);
     CHECK(g_free_under_lock == 0);
+    CHECK(ml_peer_updates_take_all(ml) == NULL);
 
-    ml_peer_updates_deinit(ml);                             /* twice: harmless */
-    uint32_t next = 7;
+    ml_peer_updates_flush(ml);                              /* twice: harmless */
+    uint32_t next = 1000;
     bool ordered = true;
-    ml_peer_updates_push(ml, new_update(next));
-    CHECK(consume(ml_peer_updates_take_all(ml), &next, &ordered) == 1 && ordered);
+    for (uint32_t i = 0; i < 3; i++) ml_peer_updates_push(ml, new_update(next + i));
+    CHECK(consume(ml_peer_updates_take_all(ml), &next, &ordered) == 3 && ordered);
     CHECK(g_live == 0);
+
+    /* Repeated sessions that never drain do not accumulate. */
+    for (int session = 0; session < 5; session++) {
+        for (uint32_t i = 0; i < 100; i++) ml_peer_updates_push(ml, new_update(i));
+        ml_peer_updates_flush(ml);
+        CHECK(g_live == 0);
+    }
     free(ml);
 }
 
@@ -185,7 +194,7 @@ static void test_threaded_fifo(void) {
 
 int main(void) {
     test_burst_before_any_consumer();
-    test_deinit_frees_pending();
+    test_flush_frees_pending();
     test_interleaved_fifo();
     test_threaded_fifo();
     printf("%d peer-update checks, %d failed\n", g_total, g_failed);
