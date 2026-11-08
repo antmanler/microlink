@@ -1031,7 +1031,27 @@ static void coord_fail(microlink_t *ml, ml_noise_state_t *noise, coord_state_t *
  * State: FETCH_PEERS - Send MapRequest, parse MapResponse
  * ========================================================================== */
 
+/* Priority peer bookkeeping for the home region (ml_netcheck_apply_home). */
+static void track_priority_peer(microlink_t *ml, const uint8_t key[32], uint16_t region) {
+    ml_netcheck_t *nc = &ml->netcheck;
+    memcpy(nc->peer_key, key, 32);
+    nc->peer_key_valid = true;
+    nc->peer_region = region;
+}
+
+static bool is_tracked_peer(const microlink_t *ml, const uint8_t key[32]) {
+    return ml->netcheck.peer_key_valid && memcmp(ml->netcheck.peer_key, key, 32) == 0;
+}
+
+static void forget_priority_peer(microlink_t *ml) {
+    ml->netcheck.peer_key_valid = false;
+    ml->netcheck.peer_region = 0;
+}
+
 static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
+    /* "Peers" is the whole list: a priority peer missing from it is gone. */
+    bool full_list = cJSON_IsArray(cJSON_GetObjectItem(root, "Peers"));
+    bool priority_seen = false;
     /* Try all field names used by Tailscale (copied from v1 lines 3176-3184):
      *   "Peers"        - Full peer list (initial Stream=false response)
      *   "PeersChanged" - Incremental updates (Stream=true long-poll)
@@ -1146,6 +1166,16 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
             update->endpoint_count = ep_count;
         }
 
+        /* Same rule as wg_mgr's admission: by name, or by CONFIG_ML_PRIORITY_PEER_IP. */
+        bool is_priority = update->priority ||
+            (ml->config.priority_peer_ip != 0 && update->vpn_ip == ml->config.priority_peer_ip);
+        if (is_priority) {
+            track_priority_peer(ml, update->public_key, update->derp_region);
+            priority_seen = true;
+        } else if (is_tracked_peer(ml, update->public_key)) {
+            forget_priority_peer(ml);       /* renamed, or the priority name changed */
+        }
+
         /* Send to wg_mgr task via queue */
         if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGW(TAG, "Peer update queue full, dropping a peer update");
@@ -1154,6 +1184,8 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     }
 
 check_removed:
+    if (full_list && !priority_seen) forget_priority_peer(ml);
+
     /* Handle PeersRemoved — array of nodekey strings (long-poll delta updates) */
     cJSON *removed = cJSON_GetObjectItem(root, "PeersRemoved");
     if (removed && cJSON_IsArray(removed)) {
@@ -1172,6 +1204,7 @@ check_removed:
             const char *hex = key_item->valuestring;
             if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
             hex_to_bytes(hex, update->public_key, 32);
+            if (is_tracked_peer(ml, update->public_key)) forget_priority_peer(ml);
 
             if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                 free(update);
@@ -1210,6 +1243,10 @@ check_removed:
                         }
                     }
 
+                    if (update->derp_region > 0 && is_tracked_peer(ml, update->public_key)) {
+                        ml->netcheck.peer_region = update->derp_region;
+                    }
+
                     /* Parse endpoints if present */
                     cJSON *endpoints = cJSON_GetObjectItem(patch, "Endpoints");
                     if (endpoints) {
@@ -1240,6 +1277,10 @@ check_removed:
             patch = patch->next;
         }
     }
+
+    /* The priority peer's home region is ours while it is in the DERP map; the
+     * caller acts on a change (ml_netcheck_take_home_change). */
+    ml_netcheck_apply_home(ml);
 }
 
 /* Add Endpoints + EndpointTypes arrays to a MapRequest JSON object.
@@ -2243,13 +2284,21 @@ static void coord_handle_key_expired(microlink_t *ml, ml_noise_state_t *noise, c
     coord_fail(ml, noise, state, ML_ERR_KEY_ROTATED);
 }
 
+/* Arrival time of a queued packet: the net I/O task stamps the low 32 bits of
+ * esp_timer at receive, so time spent in the queue is not counted as RTT. */
+static int64_t coord_rx_time_us(const ml_rx_packet_t *pkt) {
+    int64_t now = esp_timer_get_time();
+    if (pkt->rx_us == 0) return now;            /* source without a stamp */
+    return now - (int64_t)(uint32_t)((uint32_t)now - pkt->rx_us);
+}
+
 /* One STUN reply from stun_rx_queue (the caller frees pkt->data). A netcheck latency
  * probe reply is taken by ml_netcheck_on_stun(); anything else is endpoint discovery,
  * and with send_update a new endpoint goes to the control plane at once. */
 static void coord_handle_stun_packet(microlink_t *ml, ml_noise_state_t *noise,
                                      const ml_rx_packet_t *pkt, bool send_update) {
     if (!pkt->data || pkt->len == 0) return;     /* shutdown wake-up (microlink_stop) */
-    if (ml_netcheck_on_stun(ml, pkt->data, pkt->len, esp_timer_get_time())) return;
+    if (ml_netcheck_on_stun(ml, pkt->data, pkt->len, coord_rx_time_us(pkt))) return;
 
     uint32_t pub_ip;
     uint16_t pub_port;
@@ -2325,14 +2374,28 @@ static void coord_handle_stun_packet(microlink_t *ml, ml_noise_state_t *noise,
     }
 }
 
+/* STUN replies waiting in stun_rx_queue: at most its depth per pass, so a flood
+ * cannot hold the long-poll loop (pings, the control-plane watchdog). */
+static void coord_drain_stun(microlink_t *ml, ml_noise_state_t *noise) {
+    ml_rx_packet_t pkt;
+    for (int i = 0; i < ML_STUN_RX_QUEUE_DEPTH; i++) {
+        if (xQueueReceive(ml->stun_rx_queue, &pkt, 0) != pdTRUE) break;
+        coord_handle_stun_packet(ml, noise, &pkt, true);
+        free(pkt.data);
+    }
+}
+
 /* The home region changed: the DERP connection follows it, and with the long-poll
  * open the control plane hears the new PreferredDERP at once. */
 static void coord_home_changed(microlink_t *ml, ml_noise_state_t *noise, bool long_poll_open) {
     ESP_LOGI(TAG, "Home DERP region: %u", ml->derp_home_region);
     ml->derp_target_gen++;
-    /* Always: a connect in flight (to the old region) must not survive. The DERP task
-     * keeps a connection that already reached the new home (derp_target_gen). */
-    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+    /* A connect in flight (to the old region) must not survive; the DERP task keeps a
+     * connection that already reached the new home (derp_target_gen). Before
+     * registration the DERP task does not connect, so there is nothing to redirect. */
+    if (xEventGroupGetBits(ml->events) & ML_EVT_COORD_REGISTERED) {
+        xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+    }
     if (long_poll_open) do_send_endpoint_update(ml, noise, true);
 }
 
@@ -2352,7 +2415,10 @@ static bool coord_run_netcheck(microlink_t *ml, ml_noise_state_t *noise, bool lo
                 free(pkt.data);
             }
             /* microlink_stop() posts an empty item to stun_rx_queue to end the wait. */
-            if (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) break;
+            if (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) {
+                ml_netcheck_abort(ml);      /* no end-of-round side effects on stop */
+                return false;
+            }
         }
     }
     if (!ml_netcheck_end(ml, esp_timer_get_time())) return false;
@@ -2444,6 +2510,7 @@ void ml_coord_task(void *arg) {
                              pdFALSE, pdFALSE, portMAX_DELAY);
         if (wb & ML_EVT_SHUTDOWN_REQUEST) {
             ESP_LOGI(TAG, "Shutdown requested before WiFi, exiting");
+            xEventGroupSetBits(ml->events, ML_EVT_EXIT_COORD);
             vTaskDelete(NULL);
             return;
         }
@@ -2767,14 +2834,18 @@ void ml_coord_task(void *arg) {
             if (ml_netcheck_due(ml, ml_get_time_ms())) {
                 coord_run_netcheck(ml, &noise, false);
             }
+            /* The priority peer's region, taken from the peers just parsed. */
+            if (ml_netcheck_take_home_change(ml)) coord_home_changed(ml, &noise, false);
 
             /* Signal DERP I/O task to connect (connection now owned by I/O task) */
             if (!ml->derp.connected) {
                 xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
                 /* Wait for DERP to connect (up to 15s) before continuing */
                 ESP_LOGI(TAG, "Waiting for DERP I/O task to connect...");
-                xEventGroupWaitBits(ml->events, ML_EVT_DERP_CONNECTED,
-                                    pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
+                EventBits_t db = xEventGroupWaitBits(ml->events,
+                                    ML_EVT_DERP_CONNECTED | ML_EVT_SHUTDOWN_REQUEST,
+                                    pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+                if (db & ML_EVT_SHUTDOWN_REQUEST) break;    /* the loop ends on it */
             }
 
             /* Start streaming long-poll for incremental updates */
@@ -2825,13 +2896,7 @@ void ml_coord_task(void *arg) {
                 }
 
                 /* STUN replies: latency probes first, then endpoint discovery. */
-                {
-                    ml_rx_packet_t stun_pkt;
-                    while (xQueueReceive(ml->stun_rx_queue, &stun_pkt, 0) == pdTRUE) {
-                        coord_handle_stun_packet(ml, &noise, &stun_pkt, true);
-                        free(stun_pkt.data);
-                    }
-                }
+                coord_drain_stun(ml, &noise);
 
                 /* DERP region latency (netcheck): after a DERP map, a rebind, and
                  * every STUN re-probe interval. Blocks at most ML_NC_STUN_TIMEOUT_MS. */
@@ -2959,6 +3024,8 @@ void ml_coord_task(void *arg) {
                 int poll_ret = poll_map_update(ml, &noise, &map_unparsed);
                 if (poll_ret > 0) {
                     last_activity_ms = now;  /* Reset watchdog */
+                    /* The priority peer moved, or the DERP map changed under us. */
+                    if (ml_netcheck_take_home_change(ml)) coord_home_changed(ml, &noise, true);
                 } else if (poll_ret < 0) {
                     ESP_LOGW(TAG, "Long-poll connection lost");
                     state = COORD_RECONNECTING;
@@ -3029,5 +3096,6 @@ void ml_coord_task(void *arg) {
     memset(&noise, 0, sizeof(noise));
 
     ESP_LOGI(TAG, "Coord task exiting");
+    xEventGroupSetBits(ml->events, ML_EVT_EXIT_COORD);
     vTaskDelete(NULL);
 }

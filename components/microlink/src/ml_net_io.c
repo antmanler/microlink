@@ -50,7 +50,7 @@ static pkt_type_t classify_packet(const uint8_t *data, size_t len) {
 }
 
 static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
-                              uint32_t src_ip, uint16_t src_port) {
+                              uint32_t src_ip, uint16_t src_port, uint32_t rx_us) {
     pkt_type_t type = classify_packet(data, len);
 
     /* Log ALL direct UDP packets for debugging */
@@ -66,6 +66,7 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
         .src_ip = src_ip,
         .src_port = src_port,
         .via_derp = false,
+        .rx_us = rx_us,
     };
 
     switch (type) {
@@ -145,13 +146,14 @@ void ml_net_io_task(void *arg) {
             socklen_t addr_len = sizeof(src_addr);
             int n = ml_recvfrom(ml->disco_sock4, udp_buf, sizeof(udp_buf), 0,
                              (struct sockaddr *)&src_addr, &addr_len);
+            uint32_t rx_us = ml_rx_stamp();
             if (n > 0) {
                 uint8_t *pkt_data = malloc(n);
                 if (pkt_data) {
                     memcpy(pkt_data, udp_buf, n);
                     uint32_t src_ip = ntohl(src_addr.sin_addr.s_addr);
                     uint16_t src_port = ntohs(src_addr.sin_port);
-                    route_udp_packet(ml, pkt_data, n, src_ip, src_port);
+                    route_udp_packet(ml, pkt_data, n, src_ip, src_port, rx_us);
                 }
             }
         }
@@ -162,6 +164,7 @@ void ml_net_io_task(void *arg) {
             socklen_t addr_len = sizeof(src_addr);
             int n = ml_recvfrom(ml->stun_sock, udp_buf, sizeof(udp_buf), 0,
                              (struct sockaddr *)&src_addr, &addr_len);
+            uint32_t rx_us = ml_rx_stamp();
             if (n > 0) {
                 uint8_t *pkt_data = malloc(n);
                 if (pkt_data) {
@@ -172,6 +175,7 @@ void ml_net_io_task(void *arg) {
                         .src_ip = ntohl(src_addr.sin_addr.s_addr),
                         .src_port = ntohs(src_addr.sin_port),
                         .via_derp = false,
+                        .rx_us = rx_us,
                     };
                     if (xQueueSend(ml->stun_rx_queue, &pkt, 0) != pdTRUE) {
                         free(pkt_data);
@@ -186,6 +190,7 @@ void ml_net_io_task(void *arg) {
             socklen_t addr_len = sizeof(src_addr6);
             int n = ml_recvfrom(ml->stun_sock6, udp_buf, sizeof(udp_buf), 0,
                              (struct sockaddr *)&src_addr6, &addr_len);
+            uint32_t rx_us = ml_rx_stamp();
             if (n > 0) {
                 uint8_t *pkt_data = malloc(n);
                 if (pkt_data) {
@@ -196,6 +201,7 @@ void ml_net_io_task(void *arg) {
                         .src_ip = 0,  /* IPv6 — use parse_response_ipv6 */
                         .src_port = ntohs(src_addr6.sin6_port),
                         .via_derp = false,
+                        .rx_us = rx_us,
                     };
                     if (xQueueSend(ml->stun_rx_queue, &pkt, 0) != pdTRUE) {
                         free(pkt_data);
@@ -206,5 +212,6 @@ void ml_net_io_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "Net I/O task exiting");
+    xEventGroupSetBits(ml->events, ML_EVT_EXIT_NET_IO);
     vTaskDelete(NULL);
 }

@@ -103,6 +103,7 @@ static void zc_pcb_recv_cb(void *arg, struct udp_pcb *pcb,
                 .src_ip = ntohl(ip_addr_get_ip4_u32(addr)),
                 .src_port = port,
                 .via_derp = false,
+                .rx_us = ml_rx_stamp(),     /* tcpip thread: the arrival time */
             };
             if (xQueueSend(ml->stun_rx_queue, &pkt, 0) != pdTRUE) {
                 free(pkt_data);

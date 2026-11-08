@@ -552,7 +552,7 @@ static void test_netcheck_choice(void) {
         CHECK(stub_binding_ip[i] == ip901 || stub_binding_ip[i] == ip902);
     CHECK(ml_netcheck_service(ml, t + 1000) == -1);         /* every region replied */
     CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
-    CHECK(ml->netcheck.last_count == 2 && ml->netcheck.probes == NULL);
+    CHECK(ml->netcheck.last_count == 2 && ml->netcheck.probes != NULL && !ml->netcheck.open);
     CHECK(!ml_netcheck_due(ml, (uint64_t)(t / 1000) + 1000));
     CHECK(ml_netcheck_due(ml, (uint64_t)(t / 1000) + 23000));
 
@@ -770,16 +770,238 @@ static void test_rebind_clears_stun(void) {
 
 extern EventBits_t shim_event_bits_set;
 
+extern EventBits_t shim_event_bits_get;
+
 static void test_home_change_reconnects_derp(void) {
     microlink_t *ml = new_ml(false);
     ml->derp_home_region = 902;
     uint32_t gen = ml->derp_target_gen;
-    /* DERP not connected yet (a connect to the old region may be in flight). */
+    /* Registered, DERP not connected yet (a connect to the old region may be in flight). */
     ml->derp.connected = false;
+    shim_event_bits_get = ML_EVT_COORD_REGISTERED;
     shim_event_bits_set = 0;
     coord_home_changed(ml, NULL, false);
     CHECK(shim_event_bits_set & ML_EVT_DERP_RECONNECT);
     CHECK(ml->derp_target_gen == gen + 1);
+    /* Not registered: the DERP task is not connecting, so no reconnect request. */
+    shim_event_bits_get = 0;
+    shim_event_bits_set = 0;
+    coord_home_changed(ml, NULL, false);
+    CHECK(!(shim_event_bits_set & ML_EVT_DERP_RECONNECT) && ml->derp_target_gen == gen + 2);
+    free(ml);
+}
+
+/* ---- round 3: priority peer home, connect backoff, late replies, stop, RTT ---- */
+
+#define PRIO_KEY "nodekey:" \
+    "1111111111111111111111111111111111111111111111111111111111111111"
+#define OTHER_KEY "nodekey:" \
+    "2222222222222222222222222222222222222222222222222222222222222222"
+
+static void test_priority_peer_home(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    microlink_set_priority_peer_name(ml, "p4-dock.tail1234.ts.net");
+    /* The priority peer's home is 902; we measure 901 as fastest. */
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":["
+        "{\"Name\":\"laptop.tail1234.ts.net.\",\"Key\":\"" OTHER_KEY "\",\"HomeDERP\":901},"
+        "{\"Name\":\"p4-dock.tail1234.ts.net.\",\"Key\":\"" PRIO_KEY "\",\"HomeDERP\":902}]}") == 0);
+    CHECK(ml->derp_home_region == 902 && ml->netcheck.peer_region == 902);
+    int64_t t = 4000000000LL;
+    nc_round(ml, t, 0xC0000201u, 10000, 0xC6336401u, 90000);
+    ml_netcheck_end(ml, t + 1000);
+    CHECK(ml->netcheck.latency_home == 901 && ml->derp_home_region == 902);
+    CHECK(!ml_netcheck_take_home_change(ml));
+
+    /* The peer moves to 901: we follow, and the change is reported once. */
+    parse_netmap(ml, "{\"PeersChangedPatch\":{\"" PRIO_KEY "\":{\"DERPRegion\":901}}}");
+    CHECK(ml->derp_home_region == 901 && ml_netcheck_take_home_change(ml));
+    CHECK(!ml_netcheck_take_home_change(ml));
+    /* An unrelated peer's patch changes nothing. */
+    parse_netmap(ml, "{\"PeersChangedPatch\":{\"" OTHER_KEY "\":{\"DERPRegion\":902}}}");
+    CHECK(ml->derp_home_region == 901 && !ml_netcheck_take_home_change(ml));
+
+    /* A region not in our map: the latency choice. */
+    parse_netmap(ml, "{\"PeersChanged\":[{\"Name\":\"p4-dock.tail1234.ts.net.\","
+                     "\"Key\":\"" PRIO_KEY "\",\"HomeDERP\":999}]}");
+    CHECK(ml->netcheck.peer_region == 999 && ml->derp_home_region == 901);
+    parse_netmap(ml, "{\"PeersChangedPatch\":{\"" PRIO_KEY "\":{\"DERPRegion\":902}}}");
+    CHECK(ml->derp_home_region == 902);
+    /* No home region (0): the latency choice. */
+    parse_netmap(ml, "{\"PeersChanged\":[{\"Name\":\"p4-dock.tail1234.ts.net.\","
+                     "\"Key\":\"" PRIO_KEY "\"}]}");
+    CHECK(ml->derp_home_region == 901);
+    parse_netmap(ml, "{\"PeersChangedPatch\":{\"" PRIO_KEY "\":{\"DERPRegion\":902}}}");
+    CHECK(ml->derp_home_region == 902);
+
+    /* Removed: the latency choice. */
+    parse_netmap(ml, "{\"PeersRemoved\":[\"" PRIO_KEY "\"]}");
+    CHECK(!ml->netcheck.peer_key_valid && ml->derp_home_region == 901);
+    ml_netcheck_take_home_change(ml);
+
+    /* A full peer list without it: the latency choice; by IP works as well. */
+    parse_netmap(ml, "{\"Peers\":[{\"Name\":\"p4-dock.tail1234.ts.net.\","
+                     "\"Key\":\"" PRIO_KEY "\",\"HomeDERP\":902}]}");
+    CHECK(ml->derp_home_region == 902);
+    parse_netmap(ml, "{\"Peers\":[{\"Name\":\"laptop.tail1234.ts.net.\","
+                     "\"Key\":\"" OTHER_KEY "\",\"HomeDERP\":901}]}");
+    CHECK(ml->derp_home_region == 901);
+    microlink_set_priority_peer_name(ml, NULL);
+    ml->config.priority_peer_ip = 0x64400003u;                  /* 100.64.0.3 */
+    parse_netmap(ml, "{\"Peers\":[{\"Name\":\"x.tail1234.ts.net.\",\"Key\":\"" OTHER_KEY "\","
+                     "\"Addresses\":[\"100.64.0.3/32\"],\"HomeDERP\":902}]}");
+    CHECK(ml->derp_home_region == 902);
+    /* No priority peer at all: the latency choice. */
+    ml->config.priority_peer_ip = 0;
+    parse_netmap(ml, "{\"Peers\":[]}");
+    CHECK(ml->derp_home_region == 901);
+    free(ml->netcheck.probes);
+    free(ml);
+}
+
+static void test_derp_backoff(void) {
+    /* util/backoff: min(n*n*10 ms, 5 s), times 0.5 to 1.5. */
+    CHECK(ml_derp_backoff_ms(0, 0) == 0);
+    CHECK(ml_derp_backoff_ms(1, 0) == 5 && ml_derp_backoff_ms(1, 0xFFFFFFFFu) == 14);
+    CHECK(ml_derp_backoff_ms(3, 0x80000000u) == 90);
+    CHECK(ml_derp_backoff_ms(100, 0) == 2500 && ml_derp_backoff_ms(100, 0xFFFFFFFFu) == 7499);
+    CHECK(!ml_derp_backoff_capped(22) && ml_derp_backoff_capped(23));   /* 4840 / 5290 ms */
+
+    /* A region whose connects keep failing loses the latency choice until a full round. */
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":[]}") == 0);
+    int64_t t = 5000000000LL;
+    nc_round(ml, t, 0xC0000201u, 80000, 0xC6336401u, 20000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+    ml->derp_failed_region = 902;
+    t += 30000000;
+    nc_round(ml, t, 0xC0000201u, 80000, 0xC6336401u, 20000);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 901);
+    CHECK(ml->derp_regions[region_idx(ml, 902)].derp_failed);
+    /* ...but the priority peer's choice still holds. */
+    CHECK(ml_nc_effective_home(ml->derp_regions, ml->derp_region_count, 902, 901) == 902);
+    /* A full round clears it. */
+    ml_netcheck_request_full(ml);
+    t += 30000000;
+    nc_round(ml, t, 0xC0000201u, 80000, 0xC6336401u, 20000);
+    CHECK(!ml->derp_regions[region_idx(ml, 902)].derp_failed && ml->derp_failed_region == 0);
+    CHECK(ml_netcheck_end(ml, t + 1000) && ml->derp_home_region == 902);
+    free(ml->netcheck.probes);
+    free(ml);
+}
+
+static void test_late_reply_dropped(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":[]}") == 0);
+    int64_t t = 6000000000LL;
+    int first = stub_binding_sent;
+    nc_round(ml, t, 0xC0000201u, 20000, 0, 0);
+    ml_netcheck_service(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL);
+    ml_netcheck_end(ml, t + ML_NC_STUN_TIMEOUT_MS * 1000LL);
+    CHECK(ml->netcheck.last_count == 1);
+    /* 902 answers after the round: taken (never endpoint STUN) but not a sample. */
+    CHECK(nc_reply(ml, first, 0xC6336401u, t, ML_NC_STUN_TIMEOUT_MS * 1000LL + 5000));
+    CHECK(ml->netcheck.lat_us[region_idx(ml, 902)] == 0 && ml->netcheck.last_count == 1);
+    /* The next round forgets those txids. */
+    ml_netcheck_request_full(ml);
+    CHECK(ml_netcheck_begin(ml, t + 30000000));
+    CHECK(!nc_reply(ml, first, 0xC6336401u, t, 30000000));
+    ml_netcheck_abort(ml);
+    CHECK(ml->netcheck.probes == NULL && !ml->netcheck.open);
+    free(ml);
+}
+
+extern int stub_dns_count;
+extern char stub_dns_host[16][64];
+extern void (*stub_dns_done[16])(void *ctx, const char *host, uint32_t ipv4);
+extern void *stub_dns_ctx[16];
+
+static void test_dns_async(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    stub_dns_count = 0;
+    CHECK(fetch_with(ml, "{\"DERPMap\":{\"Regions\":{"
+        "\"901\":{\"RegionID\":901,\"Nodes\":[{\"HostName\":\"d1.example.invalid\"}]},"
+        "\"902\":{\"RegionID\":902,\"Nodes\":[{\"HostName\":\"d2.example.invalid\"}]}}},"
+        "\"Peers\":[]}") == 0);
+    /* Lookups start without blocking; unresolved nodes are not probed yet. */
+    CHECK(!ml_netcheck_begin(ml, 7000000000LL));
+    CHECK(stub_dns_count == 2 && !strcmp(stub_dns_host[0], "d1.example.invalid"));
+    CHECK(ml->derp_regions[0].nodes[0].stun_dns_pending);
+    CHECK(!ml_netcheck_begin(ml, 7000000001LL) && stub_dns_count == 2);     /* not repeated */
+    stub_dns_done[0](stub_dns_ctx[0], stub_dns_host[0], 0xC0000201u);
+    stub_dns_done[1](stub_dns_ctx[1], stub_dns_host[1], 0);
+    CHECK(ml->derp_regions[0].nodes[0].stun_ipv4 == 0xC0000201u);
+    CHECK(!ml->derp_regions[0].nodes[0].stun_dns_pending);
+    CHECK(ml->derp_regions[1].nodes[0].stun_dns_failed);
+    int first = stub_binding_sent;
+    CHECK(ml_netcheck_begin(ml, 7100000000LL) && ml_netcheck_service(ml, 7100000000LL) >= 0);
+    CHECK(stub_binding_sent > first && stub_binding_ip[first] == 0xC0000201u);
+    ml_netcheck_abort(ml);
+    free(ml);
+}
+
+extern void *stub_rx_queue;
+extern int stub_rx_avail, stub_rx_taken;
+
+static void test_stop_and_drain(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":[]}") == 0);
+    ml_netcheck_take_home_change(ml);
+    uint16_t home = ml->derp_home_region;
+    /* Shutdown during a round: no end-of-round side effects. */
+    shim_event_bits_get = ML_EVT_SHUTDOWN_REQUEST | ML_EVT_COORD_REGISTERED;
+    shim_event_bits_set = 0;
+    CHECK(!coord_run_netcheck(ml, NULL, false));
+    CHECK(ml->netcheck.probes == NULL && ml->netcheck.last_count == 0);
+    CHECK(ml->derp_home_region == home && !(shim_event_bits_set & ML_EVT_DERP_RECONNECT));
+    shim_event_bits_get = 0;
+
+    /* The long-poll drain takes at most the queue depth per pass. */
+    int q;
+    ml->stun_rx_queue = &q;
+    stub_rx_queue = &q;
+    stub_rx_avail = 3 * ML_STUN_RX_QUEUE_DEPTH;
+    stub_rx_taken = 0;
+    coord_drain_stun(ml, NULL);
+    CHECK(stub_rx_taken == ML_STUN_RX_QUEUE_DEPTH);
+    stub_rx_avail = 1;
+    stub_rx_taken = 0;
+    coord_drain_stun(ml, NULL);
+    CHECK(stub_rx_taken == 1);
+    stub_rx_queue = NULL;
+    free(ml);
+}
+
+static void test_rtt_from_receive_time(void) {
+    microlink_t *ml = new_ml(false);
+    ml->t_stun_interval_ms = 23000;
+    CHECK(fetch_with(ml, "{" NC_MAP ",\"Peers\":[]}") == 0);
+    /* Stamp conversion: low 32 bits back to the full clock. */
+    ml_rx_packet_t pkt = {0};
+    int64_t now = esp_timer_get_time();
+    pkt.rx_us = (uint32_t)(now - 40000);
+    int64_t back = coord_rx_time_us(&pkt);
+    CHECK(back == now - 40000);
+
+    /* A reply stamped 13 ms after the send counts 13 ms, however late it is dequeued. */
+    int64_t t0 = esp_timer_get_time();
+    int first = stub_binding_sent;
+    CHECK(ml_netcheck_begin(ml, t0) && ml_netcheck_service(ml, t0) >= 0);
+    uint8_t r[20] = {0x01, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42};
+    memcpy(r + 8, stub_binding_txid[first], 12);
+    pkt.data = r;
+    pkt.len = sizeof(r);
+    pkt.rx_us = (uint32_t)(t0 + 13000);
+    usleep(30000);                                  /* dequeued 30 ms later */
+    coord_handle_stun_packet(ml, NULL, &pkt, false);
+    int ri = ml->netcheck.probes[0].region;
+    uint32_t lat = ml->netcheck.lat_us[ri];
+    CHECK(lat > 12000 && lat <= 13000);
+    ml_netcheck_abort(ml);
     free(ml);
 }
 
@@ -836,6 +1058,12 @@ static void test_eviction_prefers_idle_peers(void) {
 
 int main(void) {
     test_home_change_reconnects_derp();
+    test_priority_peer_home();
+    test_derp_backoff();
+    test_late_reply_dropped();
+    test_dns_async();
+    test_stop_and_drain();
+    test_rtt_from_receive_time();
     test_map_edits();
     test_eviction_prefers_idle_peers();
     test_rebind_clears_stun();

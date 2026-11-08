@@ -613,12 +613,18 @@ esp_err_t microlink_stop(microlink_t *ml) {
         xQueueSend(ml->stun_rx_queue, &wake, 0);
     }
 
-    /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
-     * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
-     * vTaskDelete() on them again — that causes a crash in uxListRemove
-     * because the task's list node is already invalid. Just wait and
-     * NULL the handles. */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST). Each sets its
+     * exit bit right before vTaskDelete(NULL); we must NOT call vTaskDelete() on
+     * them again (crash in uxListRemove), only wait and NULL the handles. Sockets
+     * and queues are released below, so this waits as long as a task needs. */
+    EventBits_t exit_bits = 0;
+    if (ml->net_io_task) exit_bits |= ML_EVT_EXIT_NET_IO;
+    if (ml->derp_tx_task) exit_bits |= ML_EVT_EXIT_DERP;
+    if (ml->coord_task) exit_bits |= ML_EVT_EXIT_COORD;
+    if (ml->wg_mgr_task) exit_bits |= ML_EVT_EXIT_WG_MGR;
+    if (exit_bits) {
+        xEventGroupWaitBits(ml->events, exit_bits, pdFALSE, pdTRUE, portMAX_DELAY);
+    }
 
     ml->net_io_task = NULL;
     ml->derp_tx_task = NULL;

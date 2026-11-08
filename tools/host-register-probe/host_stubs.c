@@ -60,6 +60,7 @@ void ml_identity_clear_old_node_key(microlink_t *ml) {
 }
 
 EventBits_t shim_event_bits_set;
+EventBits_t shim_event_bits_get;
 
 /* Records ml_coord_cmd_t values sent to stub_cmd_queue; other queues are ignored. */
 void *stub_cmd_queue;
@@ -82,6 +83,18 @@ BaseType_t shim_queue_send(QueueHandle_t q, const void *item) {
     return pdFALSE;
 }
 
+/* stub_rx_queue hands out stub_rx_avail empty ml_rx_packet_t items. */
+void *stub_rx_queue;
+int stub_rx_avail;
+int stub_rx_taken;
+BaseType_t shim_queue_receive(QueueHandle_t q, void *item) {
+    if (q == NULL || q != stub_rx_queue || stub_rx_avail <= 0) return pdFALSE;
+    memset(item, 0, sizeof(ml_rx_packet_t));
+    stub_rx_avail--;
+    stub_rx_taken++;
+    return pdTRUE;
+}
+
 /* DERP latency probes (ml_netcheck.c): recorded so a test can answer them. */
 int stub_binding_sent;
 uint32_t stub_binding_ip[256];
@@ -94,6 +107,22 @@ esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t ip, uint16_t port, uint
         memcpy(stub_binding_txid[stub_binding_sent], txid, 12);
     }
     stub_binding_sent++;
+    return ESP_OK;
+}
+
+/* DERP node name lookups (ml_netcheck.c): kept pending until a test answers. */
+int stub_dns_count;
+char stub_dns_host[16][64];
+void (*stub_dns_done[16])(void *ctx, const char *host, uint32_t ipv4);
+void *stub_dns_ctx[16];
+esp_err_t ml_stun_resolve_async(const char *host,
+                                void (*done)(void *ctx, const char *host, uint32_t ipv4),
+                                void *ctx) {
+    if (stub_dns_count >= 16) return ESP_FAIL;
+    snprintf(stub_dns_host[stub_dns_count], sizeof(stub_dns_host[0]), "%s", host);
+    stub_dns_done[stub_dns_count] = done;
+    stub_dns_ctx[stub_dns_count] = ctx;
+    stub_dns_count++;
     return ESP_OK;
 }
 

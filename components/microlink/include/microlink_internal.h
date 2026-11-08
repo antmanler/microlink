@@ -27,6 +27,7 @@
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
 #include "lwip/udp.h"
@@ -199,6 +200,11 @@ typedef struct {
 #define ML_EVT_SHUTDOWN_REQUEST     BIT6
 #define ML_EVT_DERP_RECONNECT       BIT7
 #define ML_EVT_DERP_CONNECT_REQ     BIT8
+/* Set by each task right before it deletes itself; microlink_stop() waits for them. */
+#define ML_EVT_EXIT_NET_IO          BIT9
+#define ML_EVT_EXIT_DERP            BIT10
+#define ML_EVT_EXIT_COORD           BIT11
+#define ML_EVT_EXIT_WG_MGR          BIT12
 
 /* ============================================================================
  * Queue Message Types
@@ -220,7 +226,14 @@ typedef struct {
     uint16_t src_port;          /* Source port (for UDP packets) */
     uint8_t src_pubkey[32];     /* Source peer key (for DERP packets) */
     bool via_derp;              /* true if received via DERP, false if direct UDP */
+    uint32_t rx_us;             /* low 32 bits of esp_timer at receive (STUN RTT) */
 } ml_rx_packet_t;
+
+/* Receive stamp for ml_rx_packet_t.rx_us; 0 is reserved for "not stamped". */
+static inline uint32_t ml_rx_stamp(void) {
+    uint32_t t = (uint32_t)esp_timer_get_time();
+    return t ? t : 1;
+}
 
 /* Coordination command */
 typedef enum {
@@ -313,6 +326,7 @@ typedef struct {
     bool stun_only;         /* true if node only serves STUN, not DERP */
     uint32_t stun_ipv4;     /* IPv4 for latency probes, host order; 0 = not resolved */
     bool stun_dns_failed;   /* host name lookup failed for this map: not retried */
+    volatile bool stun_dns_pending;   /* an asynchronous lookup is running */
 } ml_derp_node_t;
 
 typedef struct {
@@ -322,7 +336,15 @@ typedef struct {
     uint8_t node_count;
     bool avoid;             /* Avoid: never measured or chosen as home */
     bool no_measure;        /* NoMeasureNoHome: never measured or chosen as home */
+    bool derp_failed;       /* DERP connects kept failing: not a latency choice until
+                             * the next full round */
 } ml_derp_region_t;
+
+/* DERP connect retry, tailscale v1.104.0: magicsock derp.go runDerpReader uses
+ * backoff.NewBackoff(..., 5*time.Second); util/backoff waits min(n*n*10ms, max),
+ * randomized to 0.5-1.5x. A region whose wait reached the maximum counts as failing. */
+#define ML_DERP_BACKOFF_STEP_MS     10
+#define ML_DERP_BACKOFF_MAX_MS      5000
 
 /* ============================================================================
  * DERP home region by measured latency (ml_netcheck.c, owned by coord task)
@@ -374,8 +396,16 @@ typedef struct {
     uint64_t last_round_ms;                 /* start of the last round */
     uint64_t last_full_ms;
     bool ran;                               /* a round has run since start */
-    bool home_changed;                      /* set by a map change, reported by the next end() */
+    bool home_changed;                      /* derp_home_region changed, not yet acted on */
     bool next_full;
+    bool open;                              /* round accepts samples; probes are kept
+                                             * after it so late replies are recognised */
+    uint16_t latency_home;                  /* latency choice (stickiness applies here) */
+    /* Priority peer (by name or CONFIG_ML_PRIORITY_PEER_IP) and its home region: when
+     * that region is in the DERP map it is our home, so our DERP sends reach it. */
+    uint8_t peer_key[32];
+    bool peer_key_valid;
+    uint16_t peer_region;
 } ml_netcheck_t;
 
 /* ============================================================================
@@ -456,6 +486,7 @@ struct microlink_s {
     /* Bumped on every network rebind and home region change. A reconnect request
      * leaves a connection alone that completed after the last bump, to the home region. */
     volatile uint32_t derp_target_gen;
+    volatile uint16_t derp_failed_region;  /* DERP task: home region whose connects keep failing */
 
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */
@@ -591,6 +622,11 @@ bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
 
 esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t server_ip, uint16_t port,
                                 uint8_t txid_out[12]);
+/* Asynchronous IPv4 lookup (lwIP DNS on the tcpip thread). done() runs on that thread
+ * with the host name asked for and the address (host order), 0 on failure. */
+esp_err_t ml_stun_resolve_async(const char *host,
+                                void (*done)(void *ctx, const char *host, uint32_t ipv4),
+                                void *ctx);
 
 /* ml_netcheck.c: pure parts (no I/O) */
 bool ml_nc_node_can_stun(const ml_derp_node_t *n);
@@ -603,6 +639,10 @@ int ml_nc_make_plan(const ml_derp_region_t *regions, int count,
 uint16_t ml_nc_fallback_home(const ml_derp_region_t *regions, int count, uint16_t prev);
 uint16_t ml_nc_pick_home(const ml_derp_region_t *regions, int count, const uint32_t *lat_us,
                          uint16_t prev, bool prev_heard_recently);
+uint16_t ml_nc_effective_home(const ml_derp_region_t *regions, int count,
+                              uint16_t peer_region, uint16_t latency_home);
+uint32_t ml_derp_backoff_ms(int failures, uint32_t rnd);   /* rnd: uniform 32-bit */
+bool ml_derp_backoff_capped(int failures);
 /* ml_netcheck.c: one measurement round, driven by the coord task */
 bool ml_netcheck_on_derp_map(microlink_t *ml);
 void ml_netcheck_request_full(microlink_t *ml);
@@ -610,7 +650,10 @@ bool ml_netcheck_due(const microlink_t *ml, uint64_t now_ms);
 bool ml_netcheck_begin(microlink_t *ml, int64_t now_us);
 int32_t ml_netcheck_service(microlink_t *ml, int64_t now_us);
 bool ml_netcheck_on_stun(microlink_t *ml, const uint8_t *data, size_t len, int64_t now_us);
-bool ml_netcheck_end(microlink_t *ml, int64_t now_us);
+bool ml_netcheck_end(microlink_t *ml, int64_t now_us);     /* true: home changed */
+void ml_netcheck_abort(microlink_t *ml);                   /* shutdown: no side effects */
+bool ml_netcheck_apply_home(microlink_t *ml);
+bool ml_netcheck_take_home_change(microlink_t *ml);
 
 /* ml_noise.c */
 void ml_noise_init(ml_noise_state_t *state,

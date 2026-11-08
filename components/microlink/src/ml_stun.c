@@ -19,6 +19,8 @@
 #include "esp_crc.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/dns.h"
+#include "lwip/tcpip.h"
 #include <string.h>
 #include <errno.h>
 
@@ -375,6 +377,49 @@ esp_err_t ml_stun_send_binding(microlink_t *ml, uint32_t server_ip, uint16_t por
 }
 
 /* ============================================================================
+ * Asynchronous lookup for DERP node names (ml_netcheck.c): lwIP DNS on the tcpip
+ * thread, so the coord task never blocks in getaddrinfo.
+ * ========================================================================== */
+
+typedef struct {
+    void (*done)(void *ctx, const char *host, uint32_t ipv4);
+    void *ctx;
+    char host[sizeof(((ml_derp_node_t *)0)->hostname)];
+} dns_req_t;
+
+static void dns_found(const char *name, const ip_addr_t *ip, void *arg) {
+    dns_req_t *r = (dns_req_t *)arg;
+    uint32_t v4 = (ip && IP_IS_V4(ip)) ? ntohl(ip4_addr_get_u32(ip_2_ip4(ip))) : 0;
+    r->done(r->ctx, r->host, v4);
+    free(r);
+}
+
+static void dns_start(void *arg) {
+    dns_req_t *r = (dns_req_t *)arg;
+    ip_addr_t ip;
+    err_t e = dns_gethostbyname_addrtype(r->host, &ip, dns_found, r, LWIP_DNS_ADDRTYPE_IPV4);
+    if (e == ERR_OK) dns_found(r->host, &ip, r);
+    else if (e != ERR_INPROGRESS) dns_found(r->host, NULL, r);
+}
+
+esp_err_t ml_stun_resolve_async(const char *host,
+                                void (*done)(void *ctx, const char *host, uint32_t ipv4),
+                                void *ctx) {
+    /* The AT-command cellular bridge has no lwIP DNS: no lookup there. */
+    if (ml_at_socket_is_ready()) return ESP_ERR_NOT_SUPPORTED;
+    dns_req_t *r = calloc(1, sizeof(*r));
+    if (!r) return ESP_ERR_NO_MEM;
+    r->done = done;
+    r->ctx = ctx;
+    strncpy(r->host, host, sizeof(r->host) - 1);
+    if (tcpip_callback(dns_start, r) != ERR_OK) {
+        free(r);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/* ============================================================================
  * Parse Response
  * ========================================================================== */
 
@@ -399,10 +444,11 @@ bool ml_stun_parse_response(const uint8_t *data, size_t len,
         return false;
     }
 
-    /* Check txid against IPv4 txid (IPv6 responses use separate parser) */
-    if (txid_v4_valid && memcmp(data + 8, txid_v4, 12) != 0) {
-        /* Could be an IPv6 response arriving on IPv4 queue — don't warn */
-        ESP_LOGD(TAG, "STUN IPv4 txid mismatch (may be IPv6 response)");
+    /* Only the reply to our outstanding request counts. Accepting any txid once a
+     * result was in let stray replies (late latency probes, duplicates) flip the
+     * endpoint and the NAT-type check. */
+    if (!txid_v4_valid || memcmp(data + 8, txid_v4, 12) != 0) {
+        ESP_LOGD(TAG, "STUN IPv4 reply without a matching request");
         return false;
     }
 

@@ -33,13 +33,19 @@ typedef struct { int unused; } portMUX_TYPE;
 #define BIT6 (1u << 6)
 #define BIT7 (1u << 7)
 #define BIT8 (1u << 8)
+#define BIT9 (1u << 9)
+#define BIT10 (1u << 10)
+#define BIT11 (1u << 11)
+#define BIT12 (1u << 12)
 
 static inline void vTaskDelay(TickType_t ms) { usleep(ms * 1000u); }
 static inline void vTaskDelete(TaskHandle_t t) { (void)t; }
 static inline int xPortGetCoreID(void) { return 0; }
-static inline EventBits_t xEventGroupGetBits(EventGroupHandle_t e) { (void)e; return 0; }
-/* Bits set on any event group are recorded for the tests (host_stubs.c). */
+/* Bits set on any event group are recorded for the tests; reads return
+ * shim_event_bits_get, which a test sets (host_stubs.c). */
 extern EventBits_t shim_event_bits_set;
+extern EventBits_t shim_event_bits_get;
+static inline EventBits_t xEventGroupGetBits(EventGroupHandle_t e) { (void)e; return shim_event_bits_get; }
 static inline EventBits_t xEventGroupSetBits(EventGroupHandle_t e, EventBits_t b) {
     (void)e; shim_event_bits_set |= b; return b;
 }
@@ -48,8 +54,10 @@ static inline EventBits_t xEventGroupWaitBits(EventGroupHandle_t e, EventBits_t 
                                               BaseType_t a, TickType_t t) {
     (void)e; (void)b; (void)c; (void)a; (void)t; return 0;
 }
+/* Receives come from a test-filled queue (host_stubs.c); others are empty. */
+BaseType_t shim_queue_receive(QueueHandle_t q, void *item);
 static inline BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t t) {
-    (void)q; (void)item; (void)t; return pdFALSE;
+    (void)t; return shim_queue_receive(q, item);
 }
 /* The harness records what is sent to the coord command queue (host_stubs.c). */
 BaseType_t shim_queue_send(QueueHandle_t q, const void *item);

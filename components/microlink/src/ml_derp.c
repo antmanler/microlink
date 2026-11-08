@@ -488,6 +488,11 @@ void ml_derp_tx_task(void *arg) {
     uint64_t last_heartbeat_ms = 0;
     uint64_t connected_since_ms = 0;
     bool verbose_phase = false;  /* verbose logging for first 15s after connect */
+    /* Connect retry (magicsock runDerpReader + util/backoff): failures in a row to
+     * one region, and the earliest time of the next attempt. */
+    int connect_failures = 0;
+    uint16_t connect_region = 0;
+    uint64_t next_connect_ms = 0;
 
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         loop_count++;
@@ -514,26 +519,13 @@ void ml_derp_tx_task(void *arg) {
             }
         }
 
-        /* ---- Handle DERP connect request from coord task ---- */
+        /* ---- Connection upkeep: requests from coord, then connect with backoff ---- */
         {
             EventBits_t bits = xEventGroupGetBits(ml->events);
-            if ((bits & ML_EVT_DERP_CONNECT_REQ) && !ml->derp.connected) {
+            if (bits & ML_EVT_DERP_CONNECT_REQ) {
+                /* Coord just registered: try now, whatever the backoff said. */
                 xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
-                /* Retry up to 3 times with 2s backoff */
-                for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
-                    if (attempt > 0) {
-                        ESP_LOGW(TAG, "DERP connect retry %d/3 in 2s...", attempt + 1);
-                        vTaskDelay(pdMS_TO_TICKS(2000));
-                    } else {
-                        ESP_LOGI(TAG, "DERP connect requested, connecting from I/O task");
-                    }
-                    if (ml_derp_connect(ml) == ESP_OK) {
-                        connected_since_ms = ml_get_time_ms();
-                        verbose_phase = true;
-                        break;
-                    }
-                    ESP_LOGW(TAG, "DERP connect attempt %d failed", attempt + 1);
-                }
+                next_connect_ms = 0;
             }
             if ((bits & ML_EVT_DERP_RECONNECT) && ml->derp.connected &&
                 ml->derp.target_gen == ml->derp_target_gen &&
@@ -548,19 +540,34 @@ void ml_derp_tx_task(void *arg) {
                          ml->derp.connected ? "connected" : "disconnected");
                 ml_derp_disconnect(ml);
                 verbose_phase = false;
-                /* Auto-reconnect after disconnect */
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
-                    if (attempt > 0) {
-                        ESP_LOGW(TAG, "DERP reconnect retry %d/3 in 2s...", attempt + 1);
-                        vTaskDelay(pdMS_TO_TICKS(2000));
+                next_connect_ms = 0;        /* reconnected below */
+            }
+
+            /* Connect while registered, for as long as it takes. A region whose
+             * backoff reached its maximum is reported to netcheck, which leaves it
+             * out of the latency choice (not the priority peer's choice). */
+            uint64_t now_ms = ml_get_time_ms();
+            if (!ml->derp.connected && (bits & ML_EVT_COORD_REGISTERED) &&
+                now_ms >= next_connect_ms) {
+                uint16_t region = ml->derp_home_region;
+                if (region != connect_region) {
+                    connect_region = region;
+                    connect_failures = 0;
+                }
+                if (ml_derp_connect(ml) == ESP_OK) {
+                    connect_failures = 0;
+                    if (ml->derp_failed_region == region) ml->derp_failed_region = 0;
+                    connected_since_ms = ml_get_time_ms();
+                    verbose_phase = true;
+                } else {
+                    connect_failures++;
+                    uint32_t wait_ms = ml_derp_backoff_ms(connect_failures, esp_random());
+                    next_connect_ms = ml_get_time_ms() + wait_ms;
+                    if (ml_derp_backoff_capped(connect_failures)) {
+                        ml->derp_failed_region = region;
                     }
-                    if (ml_derp_connect(ml) == ESP_OK) {
-                        connected_since_ms = ml_get_time_ms();
-                        verbose_phase = true;
-                        break;
-                    }
-                    ESP_LOGW(TAG, "DERP reconnect attempt %d failed", attempt + 1);
+                    ESP_LOGW(TAG, "DERP connect to region %u failed (%d in a row), next in %lu ms",
+                             region, connect_failures, (unsigned long)wait_ms);
                 }
             }
         }
@@ -632,6 +639,7 @@ void ml_derp_tx_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "DERP I/O task exiting");
+    xEventGroupSetBits(ml->events, ML_EVT_EXIT_DERP);
     vTaskDelete(NULL);
 }
 
