@@ -1360,6 +1360,23 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
     return ESP_OK;
 }
 
+/* App traffic to a peer without a session marks that peer in wireguard-lwip
+ * (wireguard-go: a send starts a handshake). Turn each mark into a handshake on
+ * the usual routes: DERP, plus the direct path when DISCO has one. Retries are
+ * capped by wireguard-lwip (MAX_HANDSHAKE_INITIATIONS). */
+static void service_send_requests(microlink_t *ml) {
+    struct netif *netif = (struct netif *)ml->wg_netif;
+    for (int i = 0; i < ml->peer_count; i++) {
+        ml_peer_t *p = &ml->peers[i];
+        if (!p->active || p->wg_peer_index < 0) continue;
+        if (wireguardif_take_send_request(netif, (u8_t)p->wg_peer_index) ==
+            WIREGUARDIF_SEND_INITIATE) {
+            ESP_LOGI(TAG, "Outbound traffic to peer %d without a session: handshake", i);
+            ml_wg_mgr_trigger_handshake(ml, p->vpn_ip);
+        }
+    }
+}
+
 bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
     if (!ml || !ml->wg_netif) return false;
     int idx = find_peer_by_ip(ml, vpn_ip);
@@ -1619,6 +1636,7 @@ void ml_wg_mgr_task(void *arg) {
         uint64_t now = ml_get_time_ms();
         if (ml->wg_netif && now - last_wg_periodic_ms >= 400) {
             uint64_t t0 = now;
+            service_send_requests(ml);
             wireguardif_periodic((struct netif *)ml->wg_netif);
             uint64_t dt = ml_get_time_ms() - t0;
             last_wg_periodic_ms = now;

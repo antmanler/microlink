@@ -1,6 +1,7 @@
 # Host harness for the interactive-login path (DESIGN section 10, probe P3).
 #
-#   make test    unit tests of the register codec, the login getters and the coord decisions
+#   make test    unit tests of the register codec, the login getters, the coord decisions
+#                and wireguard-lwip's handshake trigger and give-up
 #   make probe   build the P3 probe
 #   make run     run the probe against the real control server (keyless register;
 #                prints states only, never the login URL)
@@ -14,6 +15,7 @@ ML       := $(HERE)/../../components/microlink
 WG       := $(ML)/components/wireguard_lwip/src
 MBEDTLS  := $(IDF_PATH)/components/mbedtls/mbedtls
 CJSON    := $(IDF_PATH)/components/json/cJSON
+LWIP_INC := $(IDF_PATH)/components/lwip/lwip/src/include
 OUT      := $(HERE)/build
 
 CC       ?= cc
@@ -44,9 +46,18 @@ $(OUT)/test_coord: $(HERE)/test_coord.c $(ML)/src/ml_coord.c $(LIB_SRC) | $(OUT)
 $(OUT)/probe: $(HERE)/probe.c $(ML)/src/ml_coord.c $(LIB_SRC) | $(OUT)
 	$(CC) $(CFLAGS) $(INCLUDES) -I$(ML)/src -o $@ $(HERE)/probe.c $(LIB_SRC) $(LDLIBS)
 
-test: $(OUT)/test_codec $(OUT)/test_coord
+test: $(OUT)/test_codec $(OUT)/test_coord $(OUT)/test_wg
 	$(OUT)/test_codec
 	$(OUT)/test_coord
+	$(OUT)/test_wg
+
+# wireguard-lwip against IDF's lwIP headers (shim-lwip/ holds the options; test_wg.c
+# supplies the lwIP functions it links). No MicroLink shims on this include path.
+WG_CRYPTO := $(addprefix $(WG)/crypto/refc/,blake2s.c chacha20.c chacha20poly1305.c poly1305-donna.c x25519.c)
+$(OUT)/test_wg: $(HERE)/test_wg.c $(WG)/wireguardif.c $(WG)/wireguard.c $(WG)/crypto.c | $(OUT)
+	$(CC) $(CFLAGS) -Wno-macro-redefined -Wno-unused-function -Wno-unused-variable \
+	    -Wno-unknown-warning-option -Wno-unterminated-string-initialization -DWIREGUARD_CRYPTO_REFC=1 \
+	    -I$(HERE)/shim-lwip -I$(LWIP_INC) -I$(WG) -I$(WG)/crypto/refc -o $@ $(HERE)/test_wg.c $(WG_CRYPTO)
 
 probe: $(OUT)/probe
 

@@ -129,6 +129,16 @@ err_t wireguardif_disconnect(struct netif *netif, u8_t peer_index);
 // Is the given peer "up"? A peer is up if it has a valid session key it can communicate with
 err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *current_ip, u16_t *current_port);
 
+// Outbound traffic without a session (wireguard-go: a send starts a handshake).
+// The output path only marks the peer; the owner's timer tick calls this to
+// read and clear the mark. INITIATE: send a handshake now (by any route).
+// RETRYING: an initiation was sent less than REKEY_TIMEOUT ago, the timer
+// retransmits it. Either way the give-up count restarts.
+#define WIREGUARDIF_SEND_NONE		0
+#define WIREGUARDIF_SEND_INITIATE	1
+#define WIREGUARDIF_SEND_RETRYING	2
+int wireguardif_take_send_request(struct netif *netif, u8_t peer_index);
+
 // Register a DERP relay output callback for peers without direct endpoints
 // This callback is invoked when a WireGuard packet needs to be sent to a peer
 // that has no direct IP endpoint (ip is 0.0.0.0 or port is 0)

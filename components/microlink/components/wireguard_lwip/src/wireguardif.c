@@ -330,6 +330,13 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 		// No valid keys!
 		result = ERR_CONN;
 	}
+	if ((result == ERR_CONN) && q) {
+		// wireguard-go SendStagedPackets(): an outbound packet without a usable
+		// keypair starts a handshake. Only mark it here; the owner's timer tick
+		// sends it (wireguardif_take_send_request), so the caller never blocks.
+		// The packet itself is dropped (no staging queue); TCP retransmits it.
+		peer->send_requested = true;
+	}
 	return result;
 }
 
@@ -392,6 +399,9 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		       ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
 		// Update the peer location
 		update_peer_addr(peer, addr, port);
+
+		// Handshake complete: the give-up cycle ends (upstream PR #39).
+		peer->handshake_attempts = 0;
 
 		wireguard_start_session(peer, true);
 		WG_DEBUG("[WG] Session started, sending keepalive to %s:%u\n",
@@ -894,6 +904,7 @@ static err_t wireguard_start_handshake(struct netif *netif, struct wireguard_pee
 		pbuf_free(pbuf);
 		peer->send_handshake = false;
 		peer->last_initiation_tx = wireguard_sys_now();
+		peer->handshake_attempts++;
 		memcpy(peer->handshake_mac1, msg.mac1, WIREGUARD_COOKIE_LEN);
 		peer->handshake_mac1_valid = true;
 	} else {
@@ -936,6 +947,8 @@ err_t wireguardif_connect(struct netif *netif, u8_t peer_index) {
 			// Force immediate handshake to the new endpoint
 			peer->send_handshake = true;
 			peer->last_initiation_tx = 0;
+			// A fresh connect starts a new give-up cycle (upstream PR #39).
+			peer->handshake_attempts = 0;
 			wireguard_start_handshake(netif, peer);
 			result = ERR_OK;
 		} else {
@@ -977,6 +990,26 @@ err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *cu
 		}
 	}
 	return result;
+}
+
+int wireguardif_take_send_request(struct netif *netif, u8_t peer_index) {
+	struct wireguard_peer *peer;
+	if (wireguardif_lookup_peer(netif, peer_index, &peer) != ERR_OK || !peer->send_requested) {
+		return WIREGUARDIF_SEND_NONE;
+	}
+	peer->send_requested = false;
+	if (peer->curr_keypair.valid) {
+		return WIREGUARDIF_SEND_NONE;
+	}
+	// wireguard-go SendHandshakeInitiation(isRetry=false): a send resets the
+	// give-up count, then honours the REKEY_TIMEOUT spacing between initiations.
+	peer->handshake_attempts = 0;
+	if (wireguardif_can_send_initiation(peer)) {
+		return WIREGUARDIF_SEND_INITIATE;
+	}
+	// An initiation is in flight: let the timer retransmit it.
+	peer->active = true;
+	return WIREGUARDIF_SEND_RETRYING;
 }
 
 err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index) {
@@ -1084,7 +1117,14 @@ static bool should_send_initiation(struct wireguard_peer *peer) {
 		} else if (peer->curr_keypair.valid && !peer->curr_keypair.initiator && wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval)) {
 			result = true;
 		} else if (!peer->curr_keypair.valid && peer->active) {
-			result = true;
+			// Retries stop after MAX_HANDSHAKE_INITIATIONS (wireguard-go
+			// expiredRetransmitHandshake, upstream PR #39); a new outbound packet
+			// or connect starts a new cycle.
+			if (peer->handshake_attempts >= MAX_HANDSHAKE_INITIATIONS) {
+				peer->active = false;
+			} else {
+				result = true;
+			}
 		}
 	}
 	return result;
@@ -1414,6 +1454,8 @@ err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index) {
 		// Force immediate handshake - clear last_initiation_tx to bypass REKEY_TIMEOUT
 		// This is safe because DISCO has confirmed the path works
 		peer->last_initiation_tx = 0;
+		// A fresh request starts a new give-up cycle (upstream PR #39).
+		peer->handshake_attempts = 0;
 		// Now start handshake immediately
 		wireguard_start_handshake(netif, peer);
 		result = ERR_OK;

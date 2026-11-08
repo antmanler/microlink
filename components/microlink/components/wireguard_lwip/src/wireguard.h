@@ -70,6 +70,14 @@
 #define REJECT_AFTER_TIME			(180)
 #define REKEY_TIMEOUT				(5)
 #define KEEPALIVE_TIMEOUT			(10)
+// Handshake give-up, after upstream MicroLink PR #39 and wireguard-go
+// device/constants.go: RekeyAttemptTime = 90 s, MaxTimerHandshakes =
+// RekeyAttemptTime / RekeyTimeout. device/timers.go gives up once more than
+// MaxTimerHandshakes retries were sent, i.e. after MaxTimerHandshakes + 2
+// initiations in all; a new outbound packet starts a new cycle.
+#define REKEY_ATTEMPT_TIME			(90)
+#define MAX_TIMER_HANDSHAKES		((REKEY_ATTEMPT_TIME) / (REKEY_TIMEOUT))
+#define MAX_HANDSHAKE_INITIATIONS	((MAX_TIMER_HANDSHAKES) + 2)
 
 // DERP relay output callback for peers without direct endpoints
 // peer_public_key: 32-byte public key to identify the destination peer
@@ -180,6 +188,14 @@ struct wireguard_peer {
 
 	// We set this flag on RX/TX of packets if we think that we should initiate a new handshake
 	bool send_handshake;
+
+	// Set by the output path when an app packet found no usable session; read and
+	// cleared by wireguardif_take_send_request() on the owner's timer tick.
+	bool send_requested;
+
+	// Initiations sent since the last completed handshake or the last fresh request
+	// (connect, connect_derp, outbound packet). Capped at MAX_HANDSHAKE_INITIATIONS.
+	uint16_t handshake_attempts;
 };
 
 struct wireguard_device {
