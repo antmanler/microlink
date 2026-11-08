@@ -26,7 +26,7 @@ LDLIBS   := -lm
 
 MBED_SRC := chacha20 chachapoly poly1305 platform_util platform constant_time base64
 LIB_SRC  := $(ML)/src/ml_register.c $(ML)/src/ml_login.c $(ML)/src/ml_h2.c $(ML)/src/ml_noise.c \
-            $(ML)/src/ml_netcheck.c \
+            $(ML)/src/ml_netcheck.c $(ML)/src/ml_peer_policy.c \
             $(ML)/src/x25519.c $(WG)/crypto/refc/blake2s.c $(CJSON)/cJSON.c \
             $(addprefix $(MBEDTLS)/library/,$(addsuffix .c,$(MBED_SRC))) $(HERE)/host_stubs.c
 

@@ -229,6 +229,7 @@ typedef enum {
     ML_CMD_UPDATE_ENDPOINTS,    /* Send endpoint update to control plane */
     ML_CMD_FORCE_RECONNECT,     /* Force reconnection (after DERP failure, etc.); never clears ERROR */
     ML_CMD_RETRY,               /* microlink_retry(): leave a retryable ERROR and reconnect */
+    ML_CMD_RESYNC_NETMAP,       /* read the full netmap again (priority peer name changed) */
 } ml_coord_cmd_t;
 
 /* Peer update (from coord to wg_mgr) */
@@ -243,6 +244,7 @@ typedef struct {
     uint8_t disco_key[32];
     char hostname[64];
     uint16_t derp_region;
+    bool priority;              /* Name matches microlink_set_priority_peer_name() */
     /* Endpoints */
     struct {
         uint32_t ip;
@@ -263,6 +265,7 @@ typedef struct {
     uint8_t disco_key[32];
     char hostname[64];
     bool active;
+    bool priority;                  /* never evicted; may evict another peer */
 
     /* Endpoints */
     struct {
@@ -500,9 +503,10 @@ struct microlink_s {
      * microlink_copy_* getters, which take id_lock). */
     bool interactive;               /* no auth key configured: identity must persist */
     volatile microlink_error_t last_error;
-    portMUX_TYPE id_lock;           /* guards auth_url and self_fqdn */
+    portMUX_TYPE id_lock;           /* guards auth_url, self_fqdn and priority_name */
     char *auth_url;                 /* heap, NULL when no login is pending; never logged */
     char self_fqdn[ML_DNS_NAME_MAX + 1];  /* own MagicDNS name from the netmap, no trailing dot */
+    char priority_name[ML_DNS_NAME_MAX + 1];  /* microlink_set_priority_peer_name(), id_lock */
     bool machine_auth_known;        /* a netmap self node has been seen */
     volatile bool machine_authorized;     /* SelfNode.MachineAuthorized (DESIGN section 7.3) */
     bool old_node_valid;            /* node key rotation pending: register carries OldNodeKey */
@@ -649,6 +653,11 @@ size_t ml_auth_url_length(const microlink_t *ml);                      /* no sta
 esp_err_t ml_auth_url_copy(const microlink_t *ml, char *buf, size_t len);
 void ml_set_self_fqdn(microlink_t *ml, const char *fqdn);
 const char *ml_device_name(const microlink_t *ml);   /* Hostinfo.Hostname */
+
+/* ml_peer_policy.c: priority peer by name, peer table admission */
+bool ml_dns_name_equal(const char *a, const char *b);
+void ml_copy_priority_name(microlink_t *ml, char *buf, size_t len);   /* "" when unset */
+int ml_peer_admit_slot(const ml_peer_t *peers, int max, bool incoming_priority, bool *evict);
 
 /* Utility */
 uint64_t ml_get_time_ms(void);

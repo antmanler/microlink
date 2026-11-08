@@ -8,6 +8,7 @@ set(SRCS
     "src/ml_wg_mgr.c"
     "src/ml_stun.c"
     "src/ml_netcheck.c"
+    "src/ml_peer_policy.c"
     "src/ml_noise.c"
     "src/ml_h2.c"
     "src/ml_udp.c"

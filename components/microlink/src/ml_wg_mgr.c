@@ -418,45 +418,25 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         return -1;  /* Silently skip — peer not in allowlist */
     }
 
+    /* Priority: the name set by microlink_set_priority_peer_name() (marked by coord on
+     * every netmap) or the configured IP. Such a peer evicts another when full. */
+    bool priority = update->priority ||
+                    (ml->config.priority_peer_ip != 0 && update->vpn_ip == ml->config.priority_peer_ip);
+
     /* Check if peer already exists */
     int idx = find_peer_by_key(ml, update->public_key);
     if (idx >= 0) {
         ESP_LOGI(TAG, "Updating existing peer (idx=%d)", idx);
     } else {
-        /* Find free slot */
-        idx = -1;
-        for (int i = 0; i < ML_MAX_PEERS; i++) {
-            if (!ml->peers[i].active) {
-                idx = i;
-                break;
+        bool evict = false;
+        idx = ml_peer_admit_slot(ml->peers, ML_MAX_PEERS, priority, &evict);
+        if (idx >= 0 && evict) {
+            ESP_LOGW(TAG, "Evicting LRU peer idx=%d for the priority peer", idx);
+            if (ml->peers[idx].wg_peer_index >= 0 && ml->wg_netif) {
+                wireguardif_remove_peer((struct netif *)ml->wg_netif,
+                                        ml->peers[idx].wg_peer_index);
             }
-        }
-
-        /* Peer table full — evict LRU non-priority peer if incoming peer is priority */
-        if (idx < 0 && ml->config.priority_peer_ip != 0 &&
-            update->vpn_ip == ml->config.priority_peer_ip) {
-            uint64_t oldest_ms = UINT64_MAX;
-            int evict_idx = -1;
-            for (int i = 0; i < ML_MAX_PEERS; i++) {
-                if (!ml->peers[i].active) continue;
-                if (ml->peers[i].vpn_ip == ml->config.priority_peer_ip) continue;
-                uint64_t last_activity = ml->peers[i].last_send_ms;
-                if (ml->peers[i].last_pong_recv_ms > last_activity)
-                    last_activity = ml->peers[i].last_pong_recv_ms;
-                if (last_activity < oldest_ms) {
-                    oldest_ms = last_activity;
-                    evict_idx = i;
-                }
-            }
-            if (evict_idx >= 0) {
-                ESP_LOGW(TAG, "Evicting LRU peer idx=%d for the priority peer", evict_idx);
-                if (ml->peers[evict_idx].wg_peer_index >= 0 && ml->wg_netif) {
-                    wireguardif_remove_peer((struct netif *)ml->wg_netif,
-                                            ml->peers[evict_idx].wg_peer_index);
-                }
-                ml->peers[evict_idx].active = false;
-                idx = evict_idx;
-            }
+            ml->peers[idx].active = false;
         }
 
         if (idx < 0) {
@@ -476,6 +456,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->hostname[sizeof(p->hostname) - 1] = '\0';
     p->derp_region = update->derp_region;
     p->active = true;
+    p->priority = priority;
 
     /* Copy endpoints */
     p->endpoint_count = update->endpoint_count;
@@ -1527,6 +1508,11 @@ void ml_wg_mgr_task(void *arg) {
     if (cached > 0) {
         ml->peer_count = cached;
         ESP_LOGI(TAG, "Pre-loaded %d cached peers from NVS", cached);
+        /* Until its netmap entry arrives, a cached peer is priority by IP only. */
+        for (int i = 0; i < cached; i++) {
+            ml->peers[i].priority = ml->config.priority_peer_ip != 0 &&
+                                    ml->peers[i].vpn_ip == ml->config.priority_peer_ip;
+        }
     }
 
     /* Wait for registration OR shutdown before proceeding */

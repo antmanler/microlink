@@ -242,6 +242,21 @@ esp_err_t microlink_copy_self_fqdn(const microlink_t *ml, char *buf, size_t len)
 esp_err_t microlink_copy_magicdns_suffix(const microlink_t *ml, char *buf, size_t len);
 
 /**
+ * @brief Always admit the peer with this MagicDNS name (for example
+ *        "p4-dock.tail1234.ts.net"; case-insensitive, a trailing dot is ignored)
+ * @param fqdn Name to match against each netmap peer's Name; NULL or "" clears it
+ * @return ESP_OK, or ESP_ERR_INVALID_ARG (NULL handle, name longer than a DNS name)
+ *
+ * The peer table holds CONFIG_ML_MAX_PEERS peers. The named peer gets a slot even
+ * when the table is full: the least recently active other peer is evicted. The match
+ * is applied again on every netmap update. Thread-safe; callable before or after
+ * microlink_start(). Called after start with a new name, it re-reads the netmap once
+ * (a short control-plane reconnect), so set it before start when possible.
+ * CONFIG_ML_PRIORITY_PEER_IP / microlink_config_t.priority_peer_ip keep working.
+ */
+esp_err_t microlink_set_priority_peer_name(microlink_t *ml, const char *fqdn);
+
+/**
  * @brief Get our assigned VPN IP
  * @return VPN IP in host byte order, 0 if not yet assigned
  */

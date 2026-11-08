@@ -616,7 +616,135 @@ static void test_netcheck_choice(void) {
     CHECK(ml_nc_pick_home(regs, 3, none, 9, false) == 901);
 }
 
+/* ---- C: priority peer by name ----------------------------------------------- */
+
+extern void *stub_cmd_queue, *stub_peer_queue;
+extern int stub_cmd_sent, stub_cmd_last;
+extern ml_peer_update_t *stub_peer_updates[64];
+extern int stub_peer_update_count;
+
+static void test_priority_name_match(void) {
+    CHECK(ml_dns_name_equal("P4-Dock.Tail1234.TS.net.", "p4-dock.tail1234.ts.net"));
+    CHECK(ml_dns_name_equal("p4-dock.tail1234.ts.net", "p4-dock.tail1234.ts.net."));
+    CHECK(!ml_dns_name_equal("p4-dock.tail1234.ts.net", "p4-dock2.tail1234.ts.net"));
+    CHECK(!ml_dns_name_equal("p4-dock", "p4-dock.tail1234.ts.net"));
+    CHECK(!ml_dns_name_equal("", ""));
+    CHECK(!ml_dns_name_equal(NULL, "a"));
+}
+
+static void test_priority_setter(void) {
+    microlink_t *ml = new_ml(false);
+    int cmdq;
+    ml->coord_cmd_queue = &cmdq;
+    stub_cmd_queue = &cmdq;
+    stub_cmd_sent = 0;
+
+    /* Before start: stored, nothing queued. */
+    ml->state = ML_STATE_IDLE;
+    CHECK(microlink_set_priority_peer_name(ml, "p4-dock.tail1234.ts.net.") == ESP_OK);
+    CHECK(!strcmp(ml->priority_name, "p4-dock.tail1234.ts.net") && stub_cmd_sent == 0);
+
+    /* Connected: the same name (any case) changes nothing; a new one re-reads the netmap. */
+    ml->state = ML_STATE_CONNECTED;
+    CHECK(microlink_set_priority_peer_name(ml, "P4-DOCK.tail1234.ts.net") == ESP_OK && stub_cmd_sent == 0);
+    CHECK(microlink_set_priority_peer_name(ml, "speaker.tail1234.ts.net") == ESP_OK);
+    CHECK(stub_cmd_sent == 1 && stub_cmd_last == ML_CMD_RESYNC_NETMAP);
+
+    /* Clearing never needs a re-read; bad arguments are refused. */
+    CHECK(microlink_set_priority_peer_name(ml, NULL) == ESP_OK && ml->priority_name[0] == '\0');
+    CHECK(stub_cmd_sent == 1);
+    char longname[ML_DNS_NAME_MAX + 3];
+    memset(longname, 'a', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    CHECK(microlink_set_priority_peer_name(ml, longname) == ESP_ERR_INVALID_ARG);
+    CHECK(microlink_set_priority_peer_name(NULL, "x") == ESP_ERR_INVALID_ARG);
+
+    /* The coord task reconnects to read the full netmap only from the long-poll. */
+    coord_state_t st = COORD_LONG_POLL;
+    coord_handle_command(ml, &st, ML_CMD_RESYNC_NETMAP);
+    CHECK(st == COORD_RECONNECTING);
+    st = COORD_FAILED;
+    coord_handle_command(ml, &st, ML_CMD_RESYNC_NETMAP);
+    CHECK(st == COORD_FAILED);
+    stub_cmd_queue = NULL;
+    free(ml);
+}
+
+static void parse_netmap(microlink_t *ml, const char *json) {
+    for (int i = 0; i < stub_peer_update_count; i++) free(stub_peer_updates[i]);
+    stub_peer_update_count = 0;
+    cJSON *root = cJSON_Parse(json);
+    parse_peers_from_map_response(ml, root);
+    cJSON_Delete(root);
+}
+
+static void test_priority_marked_on_every_netmap(void) {
+    microlink_t *ml = new_ml(false);
+    int peerq;
+    ml->peer_update_queue = &peerq;
+    stub_peer_queue = &peerq;
+    const char *map = "{\"Peers\":["
+        "{\"Name\":\"laptop.tail1234.ts.net.\",\"Addresses\":[\"100.64.0.2/32\"]},"
+        "{\"Name\":\"P4-Dock.tail1234.ts.net.\",\"Addresses\":[\"100.64.0.3/32\"]},"
+        "{\"Name\":\"p4-dock-2.tail1234.ts.net.\",\"Addresses\":[\"100.64.0.4/32\"]}]}";
+
+    parse_netmap(ml, map);                                 /* no name set: none marked */
+    CHECK(stub_peer_update_count == 3);
+    for (int i = 0; i < 3; i++) CHECK(!stub_peer_updates[i]->priority);
+
+    microlink_set_priority_peer_name(ml, "p4-dock.tail1234.ts.net");
+    parse_netmap(ml, map);
+    CHECK(stub_peer_update_count == 3);
+    CHECK(!stub_peer_updates[0]->priority && stub_peer_updates[1]->priority &&
+          !stub_peer_updates[2]->priority);
+
+    /* A changed name moves the mark on the next netmap. */
+    microlink_set_priority_peer_name(ml, "laptop.tail1234.ts.net.");
+    parse_netmap(ml, map);
+    CHECK(stub_peer_updates[0]->priority && !stub_peer_updates[1]->priority);
+
+    parse_netmap(ml, "{}");
+    stub_peer_queue = NULL;
+    free(ml);
+}
+
+static void test_priority_admission(void) {
+    ml_peer_t peers[ML_MAX_PEERS];
+    bool evict;
+    memset(peers, 0, sizeof(peers));
+    CHECK(ml_peer_admit_slot(peers, ML_MAX_PEERS, false, &evict) == 0 && !evict);
+
+    /* Full table of ordinary peers: an ordinary newcomer is refused (netmap order wins),
+     * a priority one evicts the least recently active peer. */
+    for (int i = 0; i < ML_MAX_PEERS; i++) {
+        peers[i].active = true;
+        peers[i].last_send_ms = 1000 + i * 10;
+        peers[i].last_pong_recv_ms = 500;
+    }
+    peers[5].last_send_ms = 100;
+    peers[5].last_pong_recv_ms = 3000;     /* recent pong: not the least active */
+    peers[7].last_send_ms = 200;
+    peers[7].last_pong_recv_ms = 150;
+    CHECK(ml_peer_admit_slot(peers, ML_MAX_PEERS, false, &evict) == -1 && !evict);
+    CHECK(ml_peer_admit_slot(peers, ML_MAX_PEERS, true, &evict) == 7 && evict);
+
+    /* A priority peer is never the one evicted. */
+    peers[7].priority = true;
+    int v = ml_peer_admit_slot(peers, ML_MAX_PEERS, true, &evict);
+    CHECK(v == 0 && evict);
+    for (int i = 0; i < ML_MAX_PEERS; i++) peers[i].priority = true;
+    CHECK(ml_peer_admit_slot(peers, ML_MAX_PEERS, true, &evict) == -1 && !evict);
+
+    /* A free slot is used before anything is evicted. */
+    peers[11].active = false;
+    CHECK(ml_peer_admit_slot(peers, ML_MAX_PEERS, true, &evict) == 11 && !evict);
+}
+
 int main(void) {
+    test_priority_name_match();
+    test_priority_setter();
+    test_priority_marked_on_every_netmap();
+    test_priority_admission();
     test_netcheck_plan();
     test_netcheck_choice();
     test_commands();

@@ -1053,6 +1053,11 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     int count = cJSON_GetArraySize(peers);
     ESP_LOGI(TAG, "MapResponse: %d peers", count);
 
+    /* The priority peer is marked on every netmap, so a name set or changed later
+     * applies from the next one on (microlink_set_priority_peer_name). */
+    char priority_name[ML_DNS_NAME_MAX + 1];
+    ml_copy_priority_name(ml, priority_name, sizeof(priority_name));
+
     cJSON *peer;
     cJSON_ArrayForEach(peer, peers) {
         /* Allocate peer update (freed by wg_mgr after processing) */
@@ -1063,6 +1068,9 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
 
         /* Hostname */
         cJSON *name = cJSON_GetObjectItem(peer, "Name");
+        if (name && name->valuestring && priority_name[0]) {
+            update->priority = ml_dns_name_equal(name->valuestring, priority_name);
+        }
         if (name && name->valuestring) {
             strncpy(update->hostname, name->valuestring, sizeof(update->hostname) - 1);
             /* Strip trailing dot from FQDN */
@@ -2366,6 +2374,11 @@ static void coord_handle_command(microlink_t *ml, coord_state_t *state, ml_coord
         break;
     case ML_CMD_UPDATE_ENDPOINTS:
         /* TODO: Send endpoint update on existing H2 connection */
+        break;
+    case ML_CMD_RESYNC_NETMAP:
+        /* A peer left out of the table is only known again from a full netmap, which
+         * FETCH_PEERS reads after a reconnect. Other states read one anyway. */
+        if (*state == COORD_LONG_POLL) *state = COORD_RECONNECTING;
         break;
     }
 }
