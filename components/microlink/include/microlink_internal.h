@@ -805,9 +805,13 @@ void ml_peer_updates_flush(microlink_t *ml);                   /* frees every up
 /* Utility */
 uint64_t ml_get_time_ms(void);
 
-/* Milliseconds to ticks, rounded up: a wait for a deadline never ends before it. */
+/* Milliseconds to a FreeRTOS block time that never ends before the deadline: a
+ * block of N ticks can end up to one tick early (it counts tick interrupts), so
+ * round up and add one tick, as IDF does (lwip port sys_arch.c sys_arch_sem_wait,
+ * vfs.c esp_vfs_select). A deadline already reached does not block. */
 static inline TickType_t ml_ms_to_ticks_ceil(uint64_t ms) {
-    return (TickType_t)((ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS);
+    if (ms == 0) return 0;
+    return (TickType_t)((ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS) + 1;
 }
 
 /* ============================================================================
