@@ -277,6 +277,27 @@ static err_t wg_netif_remove_fn(struct tcpip_api_call_data *call) {
     return ERR_OK;
 }
 
+/* Posted to the tcpip mailbox after the removal. When it runs, every message
+ * queued before it has run too: packet input for the netif (tcpip_inpkt) and
+ * loopback polls (netif_poll), which reference the netif and, through ICMP
+ * replies sent back out of it, the device. */
+struct wg_netif_drain {
+    struct netif *netif;
+    SemaphoreHandle_t done;
+};
+
+static void wg_netif_drain_fn(void *arg) {
+    struct wg_netif_drain *drain = (struct wg_netif_drain *)arg;
+#if LWIP_NETIF_LOOPBACK
+    /* netif_remove leaves looped-back packets queued; one whose netif_poll could
+     * not be posted (netif_loop_output's ERR_MEM path) is still here. */
+    struct pbuf *loop = drain->netif->loop_first;
+    drain->netif->loop_first = drain->netif->loop_last = NULL;
+    if (loop) pbuf_free(loop);
+#endif
+    xSemaphoreGive(drain->done);
+}
+
 static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Convert our WG private key to base64 */
     char privkey_b64[64];
@@ -1722,19 +1743,34 @@ void ml_wg_mgr_task(void *arg) {
          * only other zero-copy sender, and it has stopped. */
         ml_zerocopy_deinit(ml);
 #endif
-        /* On the tcpip thread, after every message queued before it (its mbox is
-         * FIFO), so no pending tcpip_input for this netif runs after the free
-         * below; nothing queues new ones (wg_mgr stopped, zero-copy removed). */
+        /* Out of lwIP: no route, input or loopback reaches it after this. */
         struct wg_netif_call remove_call = { .netif = netif };
         tcpip_api_call(wg_netif_remove_fn, &remove_call.base);
-        /* wireguardif_init mem_calloc'ed the device (private key, peers, session
-         * keys): wipe it, then free it. Magicsock mode never arms the device timer
-         * and has no device PCB. */
-        struct wireguard_device *device = (struct wireguard_device *)netif->state;
-        mbedtls_platform_zeroize(device, sizeof(*device));
-        mem_free(device);
-        netif->state = NULL;
-        free(netif);
+        /* Messages queued before the removal may still reference it, and under
+         * LWIP_TCPIP_CORE_LOCKING the removal did not pass through the mailbox:
+         * drain it through the tcpip thread. Nothing queues new ones (wg_mgr
+         * stopped, zero-copy removed). The static semaphore needs no allocation;
+         * if the post itself fails (no message memory), netif and device stay
+         * allocated, since freeing them could crash the tcpip thread. */
+        StaticSemaphore_t drain_sem;
+        struct wg_netif_drain drain = {
+            .netif = netif,
+            .done = xSemaphoreCreateBinaryStatic(&drain_sem),
+        };
+        if (tcpip_callback(wg_netif_drain_fn, &drain) == ERR_OK) {
+            xSemaphoreTake(drain.done, portMAX_DELAY);
+            /* wireguardif_init mem_calloc'ed the device (private key, peers,
+             * session keys): wipe it, then free it. Magicsock mode never arms the
+             * device timer and has no device PCB. */
+            struct wireguard_device *device = (struct wireguard_device *)netif->state;
+            mbedtls_platform_zeroize(device, sizeof(*device));
+            mem_free(device);
+            netif->state = NULL;
+            free(netif);
+        } else {
+            ESP_LOGE(TAG, "WG netif drain not posted: netif and device left allocated");
+        }
+        vSemaphoreDelete(drain.done);
         ml->wg_netif = NULL;
     }
 
