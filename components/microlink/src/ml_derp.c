@@ -526,8 +526,9 @@ void ml_derp_wake(microlink_t *ml) {
 }
 
 /* Connected and idle: no TX queued, no plaintext left in TLS. Sleeps until the
- * socket is readable, derp_wake_fd is written, or timeout_ms passes. */
-static void derp_wait_connected(microlink_t *ml, uint32_t timeout_ms) {
+ * socket is readable, derp_wake_fd is written, or timeout_ms passes. Returns
+ * false when select() fails. */
+static bool derp_wait_connected(microlink_t *ml, uint32_t timeout_ms) {
     int sock = ml->derp.sockfd;
     int efd = ml->derp_wake_fd;
     fd_set rd;
@@ -541,7 +542,7 @@ static void derp_wait_connected(microlink_t *ml, uint32_t timeout_ms) {
     int n = select((sock > efd ? sock : efd) + 1, &rd, NULL, NULL, &tv);
     if (n < 0) {
         ESP_LOGW(TAG, "DERP select failed: errno %d", errno);
-        return;
+        return false;
     }
     if (n > 0 && FD_ISSET(efd, &rd)) {
         /* Reset the counter. A producer that wrote after this read also queued
@@ -549,6 +550,7 @@ static void derp_wait_connected(microlink_t *ml, uint32_t timeout_ms) {
         uint64_t count;
         read(efd, &count, sizeof(count));
     }
+    return true;
 }
 #else
 /* Cellular builds: the AT socket bridge has no select() over an eventfd, so the
@@ -744,13 +746,17 @@ void ml_derp_tx_task(void *arg) {
         /* More TX than one drain takes, or plaintext TLS already decrypted (the
          * socket may be empty), is handled on the next pass without waiting. */
         if (ml->derp.connected && uxQueueMessagesWaiting(ml->derp_tx_queue) == 0 &&
-            !mbedtls_ssl_check_pending(&ml->derp.ssl)) {
+            mbedtls_ssl_get_bytes_avail(&ml->derp.ssl) == 0) {
             uint64_t deadline = last_heartbeat_ms + DERP_HEARTBEAT_LOG_MS;
             if (last_status_ms + DERP_STATUS_LOG_MS < deadline) {
                 deadline = last_status_ms + DERP_STATUS_LOG_MS;
             }
             uint64_t now = ml_get_time_ms();
-            derp_wait_connected(ml, deadline > now ? (uint32_t)(deadline - now) : 0);
+            if (!derp_wait_connected(ml, deadline > now ? (uint32_t)(deadline - now) : 0)) {
+                /* A failed select() is a broken connection: reconnect with backoff. */
+                ml_derp_disconnect(ml);
+                derp_attempt_failed(ml, &retry);
+            }
         }
 #endif
     }
