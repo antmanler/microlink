@@ -1662,8 +1662,10 @@ void ml_wg_mgr_task(void *arg) {
             uint64_t t0 = now;
             service_send_requests(ml);
             wireguardif_periodic((struct netif *)ml->wg_netif);
-            uint64_t dt = ml_get_time_ms() - t0;
-            last_wg_periodic_ms = now;
+            /* Stamped when the work ends: a pass longer than the period still
+             * leaves the task a full period of sleep before the next one. */
+            last_wg_periodic_ms = ml_get_time_ms();
+            uint64_t dt = last_wg_periodic_ms - t0;
             ESP_LOGI(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
         }
 
@@ -1672,8 +1674,8 @@ void ml_wg_mgr_task(void *arg) {
         if (now - last_disco_probe_ms >= DISCO_PROBE_PERIOD_MS) {
             uint64_t t0 = now;
             disco_periodic_probes(ml);
-            uint64_t dt = ml_get_time_ms() - t0;
-            last_disco_probe_ms = now;
+            last_disco_probe_ms = ml_get_time_ms();     /* when the work ends, as above */
+            uint64_t dt = last_disco_probe_ms - t0;
             ESP_LOGI(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
         }
 
