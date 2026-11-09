@@ -26,6 +26,7 @@
 #include "lwip/udp.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcpip.h"
+#include "lwip/priv/tcpip_priv.h"
 #include "lwip/ip_addr.h"
 #include "lwip/netif.h"
 #include "wireguardif.h"
@@ -178,13 +179,18 @@ static void zc_pcb_create_in_tcpip(void *arg) {
     xSemaphoreGive(ctx->done);
 }
 
-static void zc_pcb_remove_in_tcpip(void *arg) {
-    zc_setup_ctx_t *ctx = (zc_setup_ctx_t *)arg;
-    if (ctx->ml->zc.pcb) {
-        udp_remove(ctx->ml->zc.pcb);
-        ctx->ml->zc.pcb = NULL;
+typedef struct {
+    struct tcpip_api_call_data base;
+    microlink_t *ml;
+} zc_remove_call_t;
+
+static err_t zc_pcb_remove_in_tcpip(struct tcpip_api_call_data *call) {
+    microlink_t *ml = ((zc_remove_call_t *)call)->ml;
+    if (ml->zc.pcb) {
+        udp_remove(ml->zc.pcb);
+        ml->zc.pcb = NULL;
     }
-    xSemaphoreGive(ctx->done);
+    return ERR_OK;
 }
 
 /* ============================================================================
@@ -234,15 +240,10 @@ void ml_zerocopy_deinit(microlink_t *ml) {
 
     ESP_LOGI(TAG, "Shutting down zero-copy WG path");
 
-    zc_setup_ctx_t ctx = {
-        .ml = ml,
-        .done = xSemaphoreCreateBinary(),
-    };
-    if (!ctx.done) return;
-
-    tcpip_callback(zc_pcb_remove_in_tcpip, &ctx);
-    xSemaphoreTake(ctx.done, portMAX_DELAY);
-    vSemaphoreDelete(ctx.done);
+    /* Synchronous, with no allocation and so no failure: under core locking it
+     * runs here with the lock held, otherwise on the tcpip thread. */
+    zc_remove_call_t call = { .ml = ml };
+    tcpip_api_call(zc_pcb_remove_in_tcpip, &call.base);
 }
 
 esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
