@@ -491,16 +491,10 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
  * ========================================================================== */
 
 #ifndef CONFIG_ML_ENABLE_CELLULAR
-/* MicroLink keeps per-process state in file statics (ml_wg_mgr.c probe table,
- * ml_coord.c keepalive timers), so there is one instance, with one eventfd. */
-#define ML_EVENTFD_MAX_FDS  1
-
 esp_err_t ml_derp_wake_init(microlink_t *ml) {
-    const esp_vfs_eventfd_config_t cfg = { .max_fds = ML_EVENTFD_MAX_FDS };
+    const esp_vfs_eventfd_config_t cfg = ESP_VFS_EVENTD_CONFIG_DEFAULT();
     esp_err_t err = esp_vfs_eventfd_register(&cfg);
-    /* MicroLink registers the eventfd VFS with one slot if nobody did, so an app
-     * that needs more eventfds must register first with its own count.
-     * ESP_ERR_INVALID_STATE: the application registered it already. */
+    /* MicroLink registers IDF's default eventfd VFS if nobody has (INVALID_STATE). */
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "eventfd VFS register failed: %s", esp_err_to_name(err));
         return err;
