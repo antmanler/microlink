@@ -28,6 +28,8 @@
 #include "wireguardif.h"
 #include "wireguard.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/platform_util.h"
+#include "lwip/mem.h"
 #include <string.h>
 #include <errno.h>
 
@@ -1694,6 +1696,13 @@ void ml_wg_mgr_task(void *arg) {
         netif_set_down(netif);
         vTaskDelay(pdMS_TO_TICKS(100));
         netif_remove(netif);
+        /* wireguardif_init mem_calloc'ed the device (private key, peers, session
+         * keys): wipe it, then free it. Magicsock mode has no device timer or PCB,
+         * and wireguardif_shutdown cancelled the timer anyway. */
+        struct wireguard_device *device = (struct wireguard_device *)netif->state;
+        mbedtls_platform_zeroize(device, sizeof(*device));
+        mem_free(device);
+        netif->state = NULL;
         free(netif);
         ml->wg_netif = NULL;
     }
