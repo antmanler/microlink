@@ -34,6 +34,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #ifndef CONFIG_ML_ENABLE_CELLULAR
+#if CONFIG_LWIP_USE_ONLY_LWIP_SELECT || !CONFIG_VFS_SUPPORT_SELECT
+#error "DERP I/O selects on an eventfd: needs VFS select, not lwIP-only select"
+#endif
 #include <sys/select.h>
 #include <unistd.h>
 #include "esp_vfs_eventfd.h"
