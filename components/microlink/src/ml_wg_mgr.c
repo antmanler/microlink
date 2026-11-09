@@ -1722,15 +1722,14 @@ void ml_wg_mgr_task(void *arg) {
          * only other zero-copy sender, and it has stopped. */
         ml_zerocopy_deinit(ml);
 #endif
-        wireguardif_shutdown(netif);
         /* On the tcpip thread, after every message queued before it (its mbox is
          * FIFO), so no pending tcpip_input for this netif runs after the free
          * below; nothing queues new ones (wg_mgr stopped, zero-copy removed). */
         struct wg_netif_call remove_call = { .netif = netif };
         tcpip_api_call(wg_netif_remove_fn, &remove_call.base);
         /* wireguardif_init mem_calloc'ed the device (private key, peers, session
-         * keys): wipe it, then free it. Magicsock mode has no device timer or PCB,
-         * and wireguardif_shutdown cancelled the timer anyway. */
+         * keys): wipe it, then free it. Magicsock mode never arms the device timer
+         * and has no device PCB. */
         struct wireguard_device *device = (struct wireguard_device *)netif->state;
         mbedtls_platform_zeroize(device, sizeof(*device));
         mem_free(device);
