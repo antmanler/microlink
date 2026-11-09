@@ -7,8 +7,10 @@
  * the SSL context. Matches v1's single-threaded DERP model.
  *
  * Architecture:
- * - Poll for incoming DERP frames (TLS read) every iteration
- * - Drain TX queue between reads (TLS write)
+ * - Drain the TX queue first (TLS write), then read up to a burst of frames
+ * - Then sleep in select() on the socket and derp_wake_fd until the socket is
+ *   readable, a producer queued TX, a reconnect or shutdown was requested, or the
+ *   next log deadline; never while TLS still holds read plaintext
  * - No mutex needed — single task owns the SSL context exclusively
  *
  * Backpressure strategy (from tailscaled):
@@ -31,11 +33,22 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#ifndef CONFIG_ML_ENABLE_CELLULAR
+#include <sys/select.h>
+#include <unistd.h>
+#include "esp_vfs_eventfd.h"
+#endif
 
 static const char *TAG = "ml_derp";
 
 /* Timeout for DERP connection handshake operations */
 #define DERP_CONNECT_TIMEOUT_MS  10000
+
+/* DERP I/O task log deadlines: the heartbeat and status lines, and the verbose
+ * phase after a connect. When connected, the task sleeps until the earliest. */
+#define DERP_HEARTBEAT_LOG_MS    5000
+#define DERP_STATUS_LOG_MS       10000
+#define DERP_VERBOSE_PHASE_MS    15000
 
 /* ============================================================================
  * Custom BIO callbacks for non-blocking TLS I/O
@@ -289,6 +302,8 @@ static void route_derp_packet(microlink_t *ml, uint8_t *data, size_t len,
     QueueHandle_t target = (type == PKT_DISCO) ? ml->disco_rx_queue : ml->wg_rx_queue;
     if (xQueueSend(target, &pkt, 0) != pdTRUE) {
         free(data);
+    } else {
+        ml_wg_mgr_wake(ml);
     }
 }
 
@@ -339,19 +354,19 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
 
 /**
  * Try to read one DERP frame.
- * Uses mbedtls recv_timeout (100ms) so ssl_read never blocks indefinitely.
- * Returns: 1 = frame read and dispatched, 0 = timeout (no data), <0 = error
+ * The socket is O_NONBLOCK, so ssl_read returns at once when no record is there
+ * (SO_RCVTIMEO does not apply to a nonblocking read). The task waits in select().
+ * Returns: 1 = frame read and dispatched, 0 = no data, <0 = error
  */
 static int poll_derp_read(microlink_t *ml) {
     if (!ml->derp.connected || ml->derp.sockfd < 0) return -1;
 
-    /* Read 5-byte frame header.
-     * SO_RCVTIMEO=100ms ensures read() returns within 100ms if no data. */
+    /* Read the 5-byte frame header; returns at once if nothing is buffered. */
     uint8_t header[5];
     int n = mbedtls_ssl_read(&ml->derp.ssl, header, 5);
     if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
         n == MBEDTLS_ERR_SSL_TIMEOUT) {
-        return 0;  /* No data available / timeout */
+        return 0;  /* No data available */
     }
     if (n <= 0) {
         ESP_LOGW(TAG, "DERP header read returned %d (0x%04x)", n, n < 0 ? -n : 0);
@@ -454,6 +469,7 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
     /* Try to send to queue */
     if ((is_wg_handshake ? xQueueSendToFront(ml->derp_tx_queue, &item, 0)
                          : xQueueSend(ml->derp_tx_queue, &item, 0)) == pdTRUE) {
+        ml_derp_wake(ml);
         return ESP_OK;
     }
 
@@ -464,6 +480,7 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
             free(dropped.data);  /* Drop oldest */
         }
         if (xQueueSend(ml->derp_tx_queue, &item, 0) == pdTRUE) {
+            ml_derp_wake(ml);
             return ESP_OK;
         }
     }
@@ -471,6 +488,95 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
     /* Still full after 3 attempts, drop new packet */
     free(pkt_data);
     return ESP_ERR_TIMEOUT;
+}
+
+/* ============================================================================
+ * DERP I/O task wake-up
+ * ========================================================================== */
+
+#ifndef CONFIG_ML_ENABLE_CELLULAR
+/* MicroLink keeps per-process state in file statics (ml_wg_mgr.c probe table,
+ * ml_coord.c keepalive timers), so there is one instance, with one eventfd. */
+#define ML_EVENTFD_MAX_FDS  1
+
+esp_err_t ml_derp_wake_init(microlink_t *ml) {
+    const esp_vfs_eventfd_config_t cfg = { .max_fds = ML_EVENTFD_MAX_FDS };
+    esp_err_t err = esp_vfs_eventfd_register(&cfg);
+    /* ESP_ERR_INVALID_STATE: the application registered it already. */
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "eventfd VFS register failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ml->derp_wake_fd = eventfd(0, 0);
+    if (ml->derp_wake_fd < 0) {
+        ESP_LOGE(TAG, "eventfd failed: errno %d", errno);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+void ml_derp_wake_deinit(microlink_t *ml) {
+    if (ml->derp_wake_fd >= 0) {
+        close(ml->derp_wake_fd);
+        ml->derp_wake_fd = -1;
+    }
+}
+
+void ml_derp_wake(microlink_t *ml) {
+    uint64_t one = 1;
+    if (ml->derp_wake_fd >= 0) write(ml->derp_wake_fd, &one, sizeof(one));
+}
+
+/* Connected and idle: no TX queued, no plaintext left in TLS. Sleeps until the
+ * socket is readable, derp_wake_fd is written, or timeout_ms passes. */
+static void derp_wait_connected(microlink_t *ml, uint32_t timeout_ms) {
+    int sock = ml->derp.sockfd;
+    int efd = ml->derp_wake_fd;
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(sock, &rd);
+    FD_SET(efd, &rd);
+    struct timeval tv = {
+        .tv_sec = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000,
+    };
+    int n = select((sock > efd ? sock : efd) + 1, &rd, NULL, NULL, &tv);
+    if (n < 0) {
+        ESP_LOGW(TAG, "DERP select failed: errno %d", errno);
+        return;
+    }
+    if (n > 0 && FD_ISSET(efd, &rd)) {
+        /* Reset the counter. A producer that wrote after this read also queued
+         * its item first, so the next TX drain finds it. */
+        uint64_t count;
+        read(efd, &count, sizeof(count));
+    }
+}
+#else
+/* Cellular builds: the AT socket bridge has no select() over an eventfd, so the
+ * connected DERP task polls (ml_derp_tx_task) and nothing needs waking. */
+esp_err_t ml_derp_wake_init(microlink_t *ml) {
+    ml->derp_wake_fd = -1;
+    return ESP_OK;
+}
+void ml_derp_wake_deinit(microlink_t *ml) { (void)ml; }
+void ml_derp_wake(microlink_t *ml) { (void)ml; }
+#endif
+
+/* Not connected: nothing to read or send. Sleeps until coord asks for a connection
+ * (or registers, while it is not), a reconnect or shutdown is requested, or the
+ * connect backoff ends; with no attempt due, without a timeout. */
+static void derp_wait_disconnected(microlink_t *ml, const ml_derp_retry_t *retry) {
+    EventBits_t bits = xEventGroupGetBits(ml->events);
+    bool registered = (bits & ML_EVT_COORD_REGISTERED) != 0;
+    EventBits_t wait = ML_EVT_SHUTDOWN_REQUEST | ML_EVT_DERP_CONNECT_REQ | ML_EVT_DERP_RECONNECT;
+    if (!registered) wait |= ML_EVT_COORD_REGISTERED;   /* while set it would end every wait */
+    TickType_t ticks = portMAX_DELAY;
+    if (registered && retry->home_decided) {
+        uint64_t now = ml_get_time_ms();
+        ticks = ml_ms_to_ticks_ceil(retry->next_ms > now ? retry->next_ms - now : 0);
+    }
+    xEventGroupWaitBits(ml->events, wait, pdFALSE, pdFALSE, ticks);
 }
 
 /* ============================================================================
@@ -517,8 +623,9 @@ void ml_derp_tx_task(void *arg) {
         loop_count++;
         uint64_t loop_start = ml_get_time_ms();
 
-        /* Unconditional heartbeat - proves task is alive */
-        if (loop_start - last_heartbeat_ms > 5000) {
+        /* Heartbeat - proves task is alive (while connected; a disconnected task
+         * sleeps until its next connect attempt or request) */
+        if (loop_start - last_heartbeat_ms >= DERP_HEARTBEAT_LOG_MS) {
             ESP_LOGW(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
                      (unsigned long)frames_rx, (unsigned long)frames_tx,
@@ -526,10 +633,10 @@ void ml_derp_tx_task(void *arg) {
             last_heartbeat_ms = loop_start;
         }
 
-        /* ---- Periodic status logging (always, even when disconnected) ---- */
+        /* ---- Periodic status logging (connected, or when a disconnected wait ends) ---- */
         {
             uint64_t now_ms = loop_start;
-            if (now_ms - last_status_ms > 10000) {
+            if (now_ms - last_status_ms >= DERP_STATUS_LOG_MS) {
                 ESP_LOGI(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
                          ml->derp.connected, ml->derp.sockfd,
                          (unsigned long)frames_rx, (unsigned long)frames_tx,
@@ -580,13 +687,12 @@ void ml_derp_tx_task(void *arg) {
         }
 
         /* Disable verbose logging after 15s */
-        if (verbose_phase && ml_get_time_ms() - connected_since_ms > 15000) {
+        if (verbose_phase && ml_get_time_ms() - connected_since_ms >= DERP_VERBOSE_PHASE_MS) {
             verbose_phase = false;
         }
 
         if (!ml->derp.connected) {
-            /* Not connected - just wait and check again */
-            vTaskDelay(pdMS_TO_TICKS(100));
+            derp_wait_disconnected(ml, &retry);
             continue;
         }
 
@@ -642,8 +748,26 @@ void ml_derp_tx_task(void *arg) {
             }
         }
 
-        /* Yield briefly */
+        /* ---- Phase 3: Sleep until there is work ---- */
+#ifdef CONFIG_ML_ENABLE_CELLULAR
+        /* AT sockets: no select() over the wake eventfd, so poll. */
         vTaskDelay(pdMS_TO_TICKS(1));
+#else
+        /* More TX than one drain takes, or plaintext TLS already decrypted (the
+         * socket may be empty), is handled on the next pass without waiting. */
+        if (ml->derp.connected && uxQueueMessagesWaiting(ml->derp_tx_queue) == 0 &&
+            !mbedtls_ssl_check_pending(&ml->derp.ssl)) {
+            uint64_t deadline = last_heartbeat_ms + DERP_HEARTBEAT_LOG_MS;
+            if (last_status_ms + DERP_STATUS_LOG_MS < deadline) {
+                deadline = last_status_ms + DERP_STATUS_LOG_MS;
+            }
+            if (verbose_phase && connected_since_ms + DERP_VERBOSE_PHASE_MS < deadline) {
+                deadline = connected_since_ms + DERP_VERBOSE_PHASE_MS;
+            }
+            uint64_t now = ml_get_time_ms();
+            derp_wait_connected(ml, deadline > now ? (uint32_t)(deadline - now) : 0);
+        }
+#endif
     }
 
     ml_derp_disconnect(ml);
@@ -915,10 +1039,10 @@ esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region) {
         ESP_LOGI(TAG, "HTTP 101 Switching Protocols received");
     }
 
-    /* Match v1 exactly: O_NONBLOCK + short SO_RCVTIMEO + SO_SNDTIMEO.
-     * O_NONBLOCK ensures read()/write() never block indefinitely.
-     * SO_RCVTIMEO provides 100ms polling rhythm for reads.
-     * SO_SNDTIMEO prevents writes from blocking too long. */
+    /* Match v1: O_NONBLOCK + SO_RCVTIMEO + SO_SNDTIMEO.
+     * O_NONBLOCK makes read()/write() return at once (EAGAIN) instead of
+     * blocking; lwIP ignores SO_RCVTIMEO for a nonblocking read, so the 100ms
+     * value sets no read rhythm. The I/O task waits for data in select(). */
     {
         int flags = ml_fcntl(sock, F_GETFL, 0);
         if (flags >= 0) {
@@ -1066,8 +1190,8 @@ esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region) {
         derp_write_frame(ml, DERP_FRAME_NOTE_PREFERRED, &preferred, 1);
     }
 
-    /* Switch socket to short timeout for data phase.
-     * Long timeout was needed for TLS handshake, but polling must be fast. */
+    /* Data-phase receive timeout. The socket is O_NONBLOCK, so a read never waits
+     * for it; the I/O task sleeps in select() instead. */
     {
         struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };  /* 200ms */
         ml_setsockopt(ml->derp.sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));

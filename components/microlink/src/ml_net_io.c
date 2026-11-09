@@ -78,11 +78,15 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
     case PKT_DISCO:
         if (xQueueSend(ml->disco_rx_queue, &pkt, 0) != pdTRUE) {
             free(data);
+        } else {
+            ml_wg_mgr_wake(ml);
         }
         break;
     case PKT_WIREGUARD:
         if (xQueueSend(ml->wg_rx_queue, &pkt, 0) != pdTRUE) {
             free(data);
+        } else {
+            ml_wg_mgr_wake(ml);
         }
         break;
     default:

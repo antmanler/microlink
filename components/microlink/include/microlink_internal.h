@@ -514,6 +514,10 @@ struct microlink_s {
     QueueHandle_t wg_rx_queue;          /* net_io -> wg_mgr */
     QueueHandle_t stun_rx_queue;        /* net_io -> coord */
     QueueHandle_t coord_cmd_queue;      /* any -> coord */
+    /* eventfd that wakes the DERP I/O task from its select(): written after every
+     * derp_tx_queue send and on reconnect and shutdown requests (ml_derp_wake).
+     * -1 in cellular builds, whose DERP task polls (ml_derp.c). */
+    int derp_wake_fd;
 
     /* coord -> wg_mgr: pending peer updates, oldest first, with no bound.
      * peer_updates_lock guards both pointers and every link (ml_peer_updates.c). */
@@ -649,6 +653,9 @@ esp_err_t ml_derp_connect(microlink_t *ml, uint16_t region);
 void ml_derp_disconnect(microlink_t *ml);
 esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len);
+esp_err_t ml_derp_wake_init(microlink_t *ml);   /* creates derp_wake_fd */
+void ml_derp_wake_deinit(microlink_t *ml);
+void ml_derp_wake(microlink_t *ml);   /* after a derp_tx_queue send, a reconnect or shutdown request */
 
 /* ml_coord.c */
 void ml_coord_task(void *arg);
@@ -659,6 +666,9 @@ void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip);
 esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip);
 bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip);
 void ml_wg_mgr_update_transport(microlink_t *ml);
+/* After a send to disco_rx_queue or wg_rx_queue, a zero-copy DISCO ring write, a peer
+ * update push, or a shutdown request: the task sleeps until then or its next timer. */
+void ml_wg_mgr_wake(microlink_t *ml);
 
 /* ml_stun.c */
 esp_err_t ml_stun_resolve_servers(microlink_t *ml);
@@ -794,6 +804,11 @@ void ml_peer_updates_flush(microlink_t *ml);                   /* frees every up
 
 /* Utility */
 uint64_t ml_get_time_ms(void);
+
+/* Milliseconds to ticks, rounded up: a wait for a deadline never ends before it. */
+static inline TickType_t ml_ms_to_ticks_ceil(uint64_t ms) {
+    return (TickType_t)((ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS);
+}
 
 /* ============================================================================
  * Network Socket Wrappers — Route through AT sockets when cellular active

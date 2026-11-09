@@ -285,6 +285,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->stun_sock = -1;
     ml->stun_sock6 = -1;
     ml->derp.sockfd = -1;
+    ml->derp_wake_fd = -1;
 
     /* Resolve timing (0 = use defaults from #defines) */
     ml->t_disco_heartbeat_ms = ml->config.disco_heartbeat_ms ? ml->config.disco_heartbeat_ms : ML_DISCO_HEARTBEAT_MS;
@@ -389,6 +390,13 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue ||
         !ml->stun_rx_queue || !ml->coord_cmd_queue) {
         ESP_LOGE(TAG, "Failed to create queues");
+        microlink_destroy(ml);
+        return NULL;
+    }
+
+    /* Wakes the DERP I/O task on derp_tx_queue sends. Lives as long as the queue:
+     * microlink_send() may enqueue whenever the instance exists. */
+    if (ml_derp_wake_init(ml) != ESP_OK) {
         microlink_destroy(ml);
         return NULL;
     }
@@ -569,6 +577,7 @@ esp_err_t microlink_rebind(microlink_t *ml) {
      * Pending TX packets are drained but WG state is preserved. */
     xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECTED);
     xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+    ml_derp_wake(ml);
     ESP_LOGI(TAG, "Rebind: signaled coord + DERP to reconnect");
 
     /* Step 4: Brief delay for coord/DERP to process reconnect signals */
@@ -642,6 +651,9 @@ esp_err_t microlink_stop(microlink_t *ml) {
 
     ESP_LOGI(TAG, "Stopping...");
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
+    /* End the DERP and wg_mgr sleeps (select() and task notification). */
+    ml_derp_wake(ml);
+    ml_wg_mgr_wake(ml);
     /* End a netcheck round blocked on stun_rx_queue (an empty item, see ml_coord.c). */
     if (ml->stun_rx_queue) {
         ml_rx_packet_t wake = {0};
@@ -667,6 +679,11 @@ esp_err_t microlink_stop(microlink_t *ml) {
     if (exit_bits) {
         xEventGroupWaitBits(ml->events, exit_bits, pdFALSE, pdTRUE, portMAX_DELAY);
     }
+    /* Remove the zero-copy PCB before deleting wg_mgr: its receive callback (tcpip
+     * thread) notifies wg_mgr_task, which must not be a deleted task. */
+#ifdef CONFIG_ML_ZERO_COPY_WG
+    ml_zerocopy_deinit(ml);
+#endif
     reap_task(&ml->net_io_task, &ml->net_io_task_stack);
     reap_task(&ml->derp_tx_task, &ml->derp_tx_task_stack);
     reap_task(&ml->coord_task, &ml->coord_task_stack);
@@ -680,11 +697,6 @@ esp_err_t microlink_stop(microlink_t *ml) {
     if (ml->config_httpd) {
         ml_config_httpd_stop(ml->config_httpd);
     }
-
-    /* Clean up zero-copy PCB if active */
-#ifdef CONFIG_ML_ZERO_COPY_WG
-    ml_zerocopy_deinit(ml);
-#endif
 
     /* Close sockets */
     if (ml->disco_sock4 >= 0) { ml_close_sock(ml->disco_sock4); ml->disco_sock4 = -1; }
@@ -719,6 +731,7 @@ esp_err_t microlink_destroy(microlink_t *ml) {
     if (ml->wg_rx_queue) vQueueDelete(ml->wg_rx_queue);
     if (ml->stun_rx_queue) vQueueDelete(ml->stun_rx_queue);
     if (ml->coord_cmd_queue) vQueueDelete(ml->coord_cmd_queue);
+    ml_derp_wake_deinit(ml);
     /* Pending peer updates were freed by microlink_stop() above. */
 
     /* Delete event group */

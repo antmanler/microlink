@@ -36,6 +36,7 @@ set(REQUIRES
     driver
     esp_driver_tsens
     esp_http_server
+    vfs
 )
 
 idf_component_register(

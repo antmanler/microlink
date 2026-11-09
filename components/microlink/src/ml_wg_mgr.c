@@ -1521,6 +1521,17 @@ static void disco_periodic_probes(microlink_t *ml) {
  * WG Manager Task
  * ========================================================================== */
 
+/* wg_mgr timers: WireGuard periodic processing (handshakes, keepalives, rekeys)
+ * and the DISCO probe round. Between them the task sleeps until a producer wakes it. */
+#define WG_PERIODIC_MS          400
+#define DISCO_PROBE_PERIOD_MS   1000
+
+void ml_wg_mgr_wake(microlink_t *ml) {
+    /* NULL before the task exists; it drains everything once it starts. */
+    TaskHandle_t task = ml->wg_mgr_task;
+    if (task) xTaskNotifyGive(task);
+}
+
 void ml_wg_mgr_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "WG Manager task started (Core %d)", xPortGetCoreID());
@@ -1645,7 +1656,7 @@ void ml_wg_mgr_task(void *arg) {
          * preventing heavy crypto (X25519, ChaCha20-Poly1305) from monopolizing
          * the TCPIP thread and blocking all socket operations system-wide. */
         uint64_t now = ml_get_time_ms();
-        if (ml->wg_netif && now - last_wg_periodic_ms >= 400) {
+        if (ml->wg_netif && now - last_wg_periodic_ms >= WG_PERIODIC_MS) {
             uint64_t t0 = now;
             service_send_requests(ml);
             wireguardif_periodic((struct netif *)ml->wg_netif);
@@ -1656,7 +1667,7 @@ void ml_wg_mgr_task(void *arg) {
 
         /* Periodic DISCO probes (every 1s check) */
         now = ml_get_time_ms();
-        if (now - last_disco_probe_ms > 1000) {
+        if (now - last_disco_probe_ms >= DISCO_PROBE_PERIOD_MS) {
             uint64_t t0 = now;
             disco_periodic_probes(ml);
             uint64_t dt = ml_get_time_ms() - t0;
@@ -1664,9 +1675,15 @@ void ml_wg_mgr_task(void *arg) {
             ESP_LOGI(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
         }
 
-        /* Yield - 10ms loop rate for minimum packet processing latency.
-         * Each wake is cheap: queue check + event bits check, no crypto. */
-        vTaskDelay(pdMS_TO_TICKS(10));
+        /* Sleep until a producer wakes us (ml_wg_mgr_wake: queued DISCO/WG packet,
+         * zero-copy DISCO ring, peer update, shutdown) or the next timer is due.
+         * A wake given while this pass ran is kept, so the take returns at once. */
+        uint64_t deadline = last_disco_probe_ms + DISCO_PROBE_PERIOD_MS;
+        if (ml->wg_netif && last_wg_periodic_ms + WG_PERIODIC_MS < deadline) {
+            deadline = last_wg_periodic_ms + WG_PERIODIC_MS;
+        }
+        now = ml_get_time_ms();
+        ulTaskNotifyTake(pdTRUE, ml_ms_to_ticks_ceil(deadline > now ? deadline - now : 0));
     }
 
     /* Shutdown WireGuard interface */

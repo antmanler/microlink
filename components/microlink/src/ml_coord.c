@@ -2404,6 +2404,7 @@ static void coord_home_changed(microlink_t *ml, ml_noise_state_t *noise, bool lo
      * registration the DERP task does not connect, so there is nothing to redirect. */
     if (xEventGroupGetBits(ml->events) & ML_EVT_COORD_REGISTERED) {
         xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+        ml_derp_wake(ml);
     }
     if (long_poll_open) do_send_endpoint_update(ml, noise, true);
 }
@@ -2995,6 +2996,8 @@ void ml_coord_task(void *arg) {
                         memset(ka_item.dest_pubkey, 0, 32);
                         if (xQueueSend(ml->derp_tx_queue, &ka_item, 0) != pdTRUE) {
                             free(ka_data);
+                        } else {
+                            ml_derp_wake(ml);
                         }
                     }
                     last_derp_keepalive_ms = now;

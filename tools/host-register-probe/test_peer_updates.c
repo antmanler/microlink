@@ -6,6 +6,7 @@
  *     Makefile also builds this test with AddressSanitizer);
  *   - the critical section becomes a real mutex, so the threaded test is a true
  *     producer/consumer race, and a free() under the lock is caught.
+ * ml_wg_mgr_wake() counts the wakes each push gives the consumer.
  */
 
 #include <pthread.h>
@@ -42,6 +43,14 @@ static void counting_free(void *p) {
     }
     free(p);
 }
+static long g_wakes;            /* ml_wg_mgr_wake() calls */
+static int g_wake_under_lock;   /* wakes given while the list lock was held */
+void ml_wg_mgr_wake(microlink_t *ml) {
+    (void)ml;
+    __atomic_fetch_add(&g_wakes, 1, __ATOMIC_RELAXED);
+    if (t_lock_depth != 0) g_wake_under_lock++;
+}
+
 #define free counting_free
 #include "ml_peer_updates.c"
 #undef free
@@ -83,8 +92,10 @@ static void test_burst_before_any_consumer(void) {
     enum { BURST = 500 };
     microlink_t *ml = new_ml();
     CHECK(ml_peer_updates_take_all(ml) == NULL);            /* empty list */
+    long wakes = g_wakes;
     for (uint32_t i = 0; i < BURST; i++) ml_peer_updates_push(ml, new_update(i));
     CHECK(g_live == BURST);
+    CHECK(g_wakes - wakes == BURST && g_wake_under_lock == 0);   /* one wake per push, unlocked */
 
     uint32_t next = 0;
     bool ordered = true;
@@ -188,6 +199,7 @@ static void test_threaded_fifo(void) {
     } while (!done);                  /* one more take after the last push */
     pthread_join(th, NULL);
     CHECK(ordered && taken == THREADED_ITEMS && next == THREADED_ITEMS);
+    CHECK(g_wake_under_lock == 0);
     CHECK(ml_peer_updates_take_all(ml) == NULL);
     CHECK(g_live == 0 && g_free_under_lock == 0);
     free(ml);

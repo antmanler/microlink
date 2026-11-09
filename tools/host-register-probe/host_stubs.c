@@ -32,6 +32,10 @@ uint64_t ml_get_time_ms(void) {
 
 const char *microlink_default_device_name(void) { return "microlink-p3-probe"; }
 
+/* No DERP or wg_mgr task runs on the host: nothing to wake. */
+void ml_derp_wake(microlink_t *ml) { (void)ml; }
+void ml_wg_mgr_wake(microlink_t *ml) { (void)ml; }
+
 void microlink_ip_to_str(uint32_t ip, char *buf) {
     snprintf(buf, 16, "%u.%u.%u.%u", (unsigned)(ip & 0xFF), (unsigned)((ip >> 8) & 0xFF),
              (unsigned)((ip >> 16) & 0xFF), (unsigned)(ip >> 24));

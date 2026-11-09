@@ -20,6 +20,7 @@ typedef struct { int unused; } portMUX_TYPE;
 #define pdPASS 1
 #define portMAX_DELAY 0xFFFFFFFFu
 #define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+#define portTICK_PERIOD_MS 1
 #define portMUX_INITIALIZE(m) ((void)(m))
 #define portENTER_CRITICAL(m) ((void)(m))
 #define portEXIT_CRITICAL(m) ((void)(m))

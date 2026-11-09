@@ -30,7 +30,7 @@ void ml_peer_updates_init(microlink_t *ml) {
     ml->peer_updates_tail = NULL;
 }
 
-/* Appends at the tail. Never blocks, never drops. */
+/* Appends at the tail and wakes wg_mgr. Never blocks, never drops. */
 void ml_peer_updates_push(microlink_t *ml, ml_peer_update_t *update) {
     update->next = NULL;
     portENTER_CRITICAL(&ml->peer_updates_lock);
@@ -41,6 +41,7 @@ void ml_peer_updates_push(microlink_t *ml, ml_peer_update_t *update) {
     }
     ml->peer_updates_tail = update;
     portEXIT_CRITICAL(&ml->peer_updates_lock);
+    ml_wg_mgr_wake(ml);
 }
 
 /* Detaches everything pending. The caller owns the returned list. */
