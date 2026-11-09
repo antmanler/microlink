@@ -502,7 +502,9 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
 esp_err_t ml_derp_wake_init(microlink_t *ml) {
     const esp_vfs_eventfd_config_t cfg = { .max_fds = ML_EVENTFD_MAX_FDS };
     esp_err_t err = esp_vfs_eventfd_register(&cfg);
-    /* ESP_ERR_INVALID_STATE: the application registered it already. */
+    /* MicroLink registers the eventfd VFS with one slot if nobody did, so an app
+     * that needs more eventfds must register first with its own count.
+     * ESP_ERR_INVALID_STATE: the application registered it already. */
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "eventfd VFS register failed: %s", esp_err_to_name(err));
         return err;

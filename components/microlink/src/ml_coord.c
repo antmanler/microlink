@@ -2321,6 +2321,7 @@ static void coord_handle_stun_packet(microlink_t *ml, ml_noise_state_t *noise,
             ml->stun_public_ip = pub_ip;
             ml->stun_public_port = pub_port;
             ml->stun_retry_count = 0;
+            ml_wg_mgr_wake(ml);     /* it sends CallMeMaybe once the endpoint is known */
             /* Send probe to fallback for symmetric NAT check */
             if (!ml->stun_nat_checked && ml->stun_fallback_ip) {
                 ml_stun_send_probe_to(ml, ml->stun_fallback_ip,
