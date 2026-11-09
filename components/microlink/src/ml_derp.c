@@ -44,23 +44,19 @@ static const char *TAG = "ml_derp";
 /* Timeout for DERP connection handshake operations */
 #define DERP_CONNECT_TIMEOUT_MS  10000
 
-/* DERP I/O task log deadlines: the heartbeat and status lines, and the verbose
- * phase after a connect. When connected, the task sleeps until the earliest. */
+/* DERP I/O task log deadlines: the heartbeat and status lines. When connected,
+ * the task sleeps until the earlier one. */
 #define DERP_HEARTBEAT_LOG_MS    5000
 #define DERP_STATUS_LOG_MS       10000
-#define DERP_VERBOSE_PHASE_MS    15000
 
 /* ============================================================================
- * Custom BIO callbacks for non-blocking TLS I/O
- *
- * These wrap lwIP recv/send with guaranteed timeout behavior.
- * We don't trust mbedtls_net_recv_timeout on lwIP because lwIP's select()
- * can sometimes block indefinitely on ESP32.
+ * Custom BIO callbacks for TLS I/O (ml_read_sock/ml_write_sock: lwIP or AT)
  * ========================================================================== */
 
 /**
- * Custom recv with timeout for mbedtls BIO.
- * Uses SO_RCVTIMEO on the socket as the timeout mechanism (simpler than select).
+ * Custom recv for mbedtls BIO. Until the HTTP upgrade the socket blocks and
+ * SO_RCVTIMEO bounds each read; after it the socket is O_NONBLOCK and a read
+ * with no data returns at once.
  * Returns bytes read, or MBEDTLS_ERR_SSL_TIMEOUT, MBEDTLS_ERR_SSL_WANT_READ.
  */
 static int ml_derp_bio_recv_timeout(void *ctx, unsigned char *buf, size_t len,
@@ -565,14 +561,14 @@ void ml_derp_wake_deinit(microlink_t *ml) { (void)ml; }
 void ml_derp_wake(microlink_t *ml) { (void)ml; }
 #endif
 
-/* Not connected: nothing to read or send. Sleeps until coord asks for a connection
- * (or registers, while it is not), a reconnect or shutdown is requested, or the
- * connect backoff ends; with no attempt due, without a timeout. */
+/* Not connected: nothing to read or send. Sleeps until coord asks for a connection,
+ * a reconnect or shutdown is requested, or the connect backoff ends; with no
+ * attempt due, without a timeout. Registration alone needs no wake: an attempt
+ * needs home_decided, which only CONNECT_REQ sets, and coord sets CONNECT_REQ
+ * after every registration. */
 static void derp_wait_disconnected(microlink_t *ml, const ml_derp_retry_t *retry) {
-    EventBits_t bits = xEventGroupGetBits(ml->events);
-    bool registered = (bits & ML_EVT_COORD_REGISTERED) != 0;
+    bool registered = (xEventGroupGetBits(ml->events) & ML_EVT_COORD_REGISTERED) != 0;
     EventBits_t wait = ML_EVT_SHUTDOWN_REQUEST | ML_EVT_DERP_CONNECT_REQ | ML_EVT_DERP_RECONNECT;
-    if (!registered) wait |= ML_EVT_COORD_REGISTERED;   /* while set it would end every wait */
     TickType_t ticks = portMAX_DELAY;
     if (registered && retry->home_decided) {
         uint64_t now = ml_get_time_ms();
@@ -616,8 +612,6 @@ void ml_derp_tx_task(void *arg) {
     uint64_t last_status_ms = 0;
     uint32_t loop_count = 0;
     uint64_t last_heartbeat_ms = 0;
-    uint64_t connected_since_ms = 0;
-    bool verbose_phase = false;  /* verbose logging for first 15s after connect */
     /* Connect retry (magicsock runDerpReader + util/backoff), ml_netcheck.c. */
     ml_derp_retry_t retry = {0};
 
@@ -668,7 +662,6 @@ void ml_derp_tx_task(void *arg) {
                 ESP_LOGW(TAG, "DERP reconnect requested (was %s)",
                          ml->derp.connected ? "connected" : "disconnected");
                 ml_derp_disconnect(ml);
-                verbose_phase = false;
                 retry.awaiting_frame = false;
                 retry.next_ms = 0;          /* reconnected below */
             }
@@ -679,18 +672,11 @@ void ml_derp_tx_task(void *arg) {
                 uint16_t region = ml->derp_home_region;
                 ml_derp_retry_attempt(&retry, region);
                 if (ml_derp_connect(ml, region) == ESP_OK) {
-                    connected_since_ms = ml_get_time_ms();
-                    verbose_phase = true;
                     if (ml->derp.server_info) derp_frame_read(ml, &retry);
                 } else {
                     derp_attempt_failed(ml, &retry);
                 }
             }
-        }
-
-        /* Disable verbose logging after 15s */
-        if (verbose_phase && ml_get_time_ms() - connected_since_ms >= DERP_VERBOSE_PHASE_MS) {
-            verbose_phase = false;
         }
 
         if (!ml->derp.connected) {
@@ -762,9 +748,6 @@ void ml_derp_tx_task(void *arg) {
             uint64_t deadline = last_heartbeat_ms + DERP_HEARTBEAT_LOG_MS;
             if (last_status_ms + DERP_STATUS_LOG_MS < deadline) {
                 deadline = last_status_ms + DERP_STATUS_LOG_MS;
-            }
-            if (verbose_phase && connected_since_ms + DERP_VERBOSE_PHASE_MS < deadline) {
-                deadline = connected_since_ms + DERP_VERBOSE_PHASE_MS;
             }
             uint64_t now = ml_get_time_ms();
             derp_wait_connected(ml, deadline > now ? (uint32_t)(deadline - now) : 0);
