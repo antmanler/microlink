@@ -24,6 +24,7 @@
 #include "lwip/ip_addr.h"
 #include "lwip/ip.h"
 #include "lwip/tcpip.h"
+#include "lwip/priv/tcpip_priv.h"
 #include "nacl_box.h"
 #include "wireguardif.h"
 #include "wireguard.h"
@@ -250,6 +251,32 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
  * WireGuard Interface Initialization
  * ========================================================================== */
 
+/* The WG netif joins and leaves lwIP on the tcpip thread (tcpip_api_call, which
+ * takes the core lock under LWIP_TCPIP_CORE_LOCKING and runs on the thread
+ * otherwise), never while that thread routes through it. */
+struct wg_netif_call {
+    struct tcpip_api_call_data base;
+    struct netif *netif;
+};
+
+static err_t wg_netif_add_fn(struct tcpip_api_call_data *call) {
+    struct netif *netif = ((struct wg_netif_call *)call)->netif;
+    /* Add to lwIP netif list (bypass netif_add which wants init callback) */
+    netif->next = netif_list;
+    netif_list = netif;
+    netif_set_up(netif);
+    netif_set_link_up(netif);
+    return ERR_OK;
+}
+
+static err_t wg_netif_remove_fn(struct tcpip_api_call_data *call) {
+    struct netif *netif = ((struct wg_netif_call *)call)->netif;
+    netif_set_link_down(netif);
+    netif_set_down(netif);
+    netif_remove(netif);
+    return ERR_OK;
+}
+
 static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Convert our WG private key to base64 */
     char privkey_b64[64];
@@ -311,13 +338,9 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
      * callback uses raw udp_sendto (not BSD sendto) to avoid deadlock. */
     netif->input = tcpip_input;
 
-    /* Add to lwIP netif list (bypass netif_add which wants init callback) */
-    netif->next = netif_list;
-    netif_list = netif;
-
-    /* Bring interface up */
-    netif_set_up(netif);
-    netif_set_link_up(netif);
+    /* Add to lwIP netif list and bring it up */
+    struct wg_netif_call add_call = { .netif = netif };
+    tcpip_api_call(wg_netif_add_fn, &add_call.base);
 
     /* Create raw UDP PCB for WG output (avoids BSD sendto deadlock on TCPIP
      * thread).  Bind to port 51820 to match the DISCO socket source port.
@@ -1693,11 +1716,18 @@ void ml_wg_mgr_task(void *arg) {
     /* Shutdown WireGuard interface */
     if (ml->wg_netif) {
         struct netif *netif = (struct netif *)ml->wg_netif;
+#ifdef CONFIG_ML_ZERO_COPY_WG
+        /* Synchronous: afterwards no zero-copy receive callback (tcpip thread)
+         * reads ml->wg_netif or passes packets to its device. This task is the
+         * only other zero-copy sender, and it has stopped. */
+        ml_zerocopy_deinit(ml);
+#endif
         wireguardif_shutdown(netif);
-        netif_set_link_down(netif);
-        netif_set_down(netif);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        netif_remove(netif);
+        /* On the tcpip thread, after every message queued before it (its mbox is
+         * FIFO), so no pending tcpip_input for this netif runs after the free
+         * below; nothing queues new ones (wg_mgr stopped, zero-copy removed). */
+        struct wg_netif_call remove_call = { .netif = netif };
+        tcpip_api_call(wg_netif_remove_fn, &remove_call.base);
         /* wireguardif_init mem_calloc'ed the device (private key, peers, session
          * keys): wipe it, then free it. Magicsock mode has no device timer or PCB,
          * and wireguardif_shutdown cancelled the timer anyway. */
