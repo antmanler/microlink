@@ -742,6 +742,7 @@ esp_err_t microlink_destroy(microlink_t *ml) {
     memset(ml->machine_private_key, 0, 32);
     memset(ml->wg_private_key, 0, 32);
     memset(ml->disco_private_key, 0, 32);
+    for (int i = 0; i < ML_MAX_PEERS; i++) ml_peer_disco_cache_clear(&ml->peers[i]);
 
     free(ml);
     ESP_LOGI(TAG, "Destroyed");

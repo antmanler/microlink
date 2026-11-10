@@ -1,8 +1,9 @@
 # Host harness for the interactive-login path (DESIGN section 10, probe P3).
 #
 #   make test    unit tests of the register codec, the login getters, the coord decisions,
-#                the coord -> wg_mgr peer-update list and wireguard-lwip's handshake
-#                trigger and give-up
+#                the coord -> wg_mgr peer-update list, wireguard-lwip's handshake
+#                trigger and give-up, and the DISCO box key (nacl_box.c vector and the
+#                per-peer key cache)
 #   make probe   build the P3 probe
 #   make run     run the probe against the real control server (keyless register;
 #                prints states only, never the login URL)
@@ -48,11 +49,21 @@ $(OUT)/test_coord: $(HERE)/test_coord.c $(ML)/src/ml_coord.c $(LIB_SRC) | $(OUT)
 $(OUT)/probe: $(HERE)/probe.c $(ML)/src/ml_coord.c $(LIB_SRC) | $(OUT)
 	$(CC) $(CFLAGS) $(INCLUDES) -I$(ML)/src -o $@ $(HERE)/probe.c $(LIB_SRC) $(LDLIBS)
 
-test: $(OUT)/test_codec $(OUT)/test_coord $(OUT)/test_wg $(OUT)/test_peer_updates
+test: $(OUT)/test_codec $(OUT)/test_coord $(OUT)/test_wg $(OUT)/test_peer_updates $(OUT)/test_disco_key
 	$(OUT)/test_codec
 	$(OUT)/test_coord
 	$(OUT)/test_wg
 	$(OUT)/test_peer_updates
+	$(OUT)/test_disco_key
+
+# nacl_box.c against the NaCl vector, and the per-peer key cache (ml_disco_key.c, included by
+# the test so the X25519 calls can be counted), under AddressSanitizer and UBSan. The real
+# nacl_box.c, x25519.c and mbedtls platform_util.c; no other firmware source.
+$(OUT)/test_disco_key: $(HERE)/test_disco_key.c $(ML)/src/ml_disco_key.c $(ML)/src/nacl_box.c \
+                       $(ML)/src/x25519.c $(MBEDTLS)/library/platform_util.c | $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer $(INCLUDES) \
+	    -o $@ $(HERE)/test_disco_key.c $(ML)/src/nacl_box.c $(ML)/src/x25519.c \
+	    $(MBEDTLS)/library/platform_util.c $(LDLIBS)
 
 # The peer-update list alone, under AddressSanitizer and UBSan (a double free or a use
 # after free aborts; LeakSanitizer adds leak reports where the platform has it). The test

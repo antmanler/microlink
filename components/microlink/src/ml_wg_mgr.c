@@ -520,9 +520,10 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     }
 
     ml_peer_t *p = &ml->peers[idx];
+    if (is_new) ml_peer_disco_cache_clear(p);   /* the slot's previous peer's key */
     p->vpn_ip = update->vpn_ip;
     memcpy(p->public_key, update->public_key, 32);
-    memcpy(p->disco_key, update->disco_key, 32);
+    ml_peer_set_disco_key(p, update->disco_key);
     strncpy(p->hostname, update->hostname, sizeof(p->hostname) - 1);
     p->hostname[sizeof(p->hostname) - 1] = '\0';
     p->derp_region = update->derp_region;
@@ -683,6 +684,7 @@ static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
     ESP_LOGI(TAG, "Peer removed: idx=%d", idx);
 
     ml->peers[idx].active = false;
+    ml_peer_disco_cache_clear(&ml->peers[idx]);
 
     /* Compact peer_count */
     while (ml->peer_count > 0 && !ml->peers[ml->peer_count - 1].active) {
@@ -734,6 +736,13 @@ static void process_peer_updates(microlink_t *ml) {
  * DISCO Protocol
  * ========================================================================== */
 
+/* The box key for DISCO with peer p, copied into key; the caller wipes it. Every DISCO
+ * encrypt and decrypt takes its key here (cache: see ml_peer_t). */
+static void disco_box_key(microlink_t *ml, ml_peer_t *p, uint8_t key[32]) {
+    bool owner = xTaskGetCurrentTaskHandle() == ml->wg_mgr_task;
+    ml_peer_disco_box_key(p, ml->disco_private_key, owner, key);
+}
+
 static void disco_build_ping(microlink_t *ml, int peer_idx,
                                uint8_t *out, size_t *out_len) {
     ml_peer_t *p = &ml->peers[peer_idx];
@@ -754,9 +763,11 @@ static void disco_build_ping(microlink_t *ml, int peer_idx,
     esp_fill_random(nonce, DISCO_NONCE_LEN);
 
     /* Encrypt with NaCl box: our disco private key -> peer's disco public key */
+    uint8_t box_key[32];
+    disco_box_key(ml, p, box_key);
     uint8_t ciphertext[46 + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, sizeof(plaintext), nonce,
-             p->disco_key, ml->disco_private_key);
+    nacl_box_afternm(ciphertext, plaintext, sizeof(plaintext), nonce, box_key);
+    mbedtls_platform_zeroize(box_key, sizeof(box_key));
 
     /* Build packet: magic(6) + our_disco_pubkey(32) + nonce(24) + ciphertext(62) = 124 bytes */
     size_t pos = 0;
@@ -815,9 +826,11 @@ static void disco_build_pong(microlink_t *ml, int peer_idx,
     esp_fill_random(nonce, DISCO_NONCE_LEN);
 
     /* Encrypt */
+    uint8_t box_key[32];
+    disco_box_key(ml, p, box_key);
     uint8_t ciphertext[32 + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, sizeof(plaintext), nonce,
-             p->disco_key, ml->disco_private_key);
+    nacl_box_afternm(ciphertext, plaintext, sizeof(plaintext), nonce, box_key);
+    mbedtls_platform_zeroize(box_key, sizeof(box_key));
 
     /* Build packet */
     size_t pos = 0;
@@ -891,20 +904,12 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
     p->last_ping_sent_ms = now;
 }
 
-static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
-                                 const uint8_t *sender_disco_key,
+static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt, int peer_idx,
                                  const uint8_t *decrypted, size_t decrypted_len) {
     if (decrypted_len < 14) return;
 
     /* Extract txid from decrypted payload */
     const uint8_t *txid = decrypted + 2;
-
-    /* Find peer by disco key */
-    int peer_idx = find_peer_by_disco_key(ml, sender_disco_key);
-    if (peer_idx < 0) {
-        ESP_LOGW(TAG, "DISCO ping from unknown peer");
-        return;
-    }
 
     ml_peer_t *p = &ml->peers[peer_idx];
 
@@ -965,8 +970,7 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
              PEER_SLOT(p), direct_sent ? "yes" : "no");
 }
 
-static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
-                                 const uint8_t *sender_disco_key,
+static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt, int sender_idx,
                                  const uint8_t *decrypted, size_t decrypted_len) {
     if (decrypted_len < 14) return;
 
@@ -1029,26 +1033,6 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                         ESP_LOGI(TAG, "WG endpoint SWITCHED to direct for peer %d", PEER_SLOT(p));
                     }
                 } else {
-                    /* [ambient-mod] Diagnostic: ask the device's own table instead
-                     * of guessing. It answered in one read what took two rounds of
-                     * speculation: which slot holds the session and whether the same
-                     * remote peer occupies two slots. Keep it. */
-                    {
-                        struct wireguard_device *dbg = (struct wireguard_device *)netif->state;
-                        ESP_LOGW(TAG, "  [peers] peer %d wants wg_idx=%d; device table:",
-                                 PEER_SLOT(p), (int)p->wg_peer_index);
-                        if (dbg) {
-                            for (int k = 0; k < WIREGUARD_MAX_PEERS; k++) {
-                                struct wireguard_peer *pp = &dbg->peers[k];
-                                if (!pp->valid) continue;
-                                ESP_LOGW(TAG, "    slot=%d active=%d curr_valid=%d prev_valid=%d "
-                                              "via=%s",
-                                         k, (int)pp->active, (int)pp->curr_keypair.valid,
-                                         (int)pp->prev_keypair.valid,
-                                         ip_addr_isany(&pp->ip) ? "DERP" : "direct");
-                            }
-                        }
-                    }
                     ESP_LOGI(TAG, "WG endpoint stored (no session) for peer %d", PEER_SLOT(p));
                     /* First direct path discovery — send a one-shot handshake
                      * via direct UDP. Do NOT use wireguardif_connect() which
@@ -1088,14 +1072,12 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
     }
 
     if (!matched) {
-        /* Find peer by disco key for logging */
-        int peer_idx = find_peer_by_disco_key(ml, sender_disco_key);
         int active_count = 0;
         for (int i = 0; i < MAX_PENDING_PROBES; i++) {
             if (pending_probes[i].active) active_count++;
         }
         ESP_LOGW(TAG, "DISCO PONG unmatched from peer %d (via %s) txid=%02x%02x%02x%02x, active_probes=%d",
-                 peer_idx, pkt->via_derp ? "DERP" : "direct",
+                 sender_idx, pkt->via_derp ? "DERP" : "direct",
                  txid[0], txid[1], txid[2], txid[3], active_count);
     }
 }
@@ -1121,12 +1103,22 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
     if (ciphertext_len < NACL_BOX_MACBYTES) return;
 
+    /* A box from a sender that is not a known peer is dropped before any crypto. */
+    int peer_idx = find_peer_by_disco_key(ml, sender_disco_key);
+    if (peer_idx < 0) {
+        ESP_LOGW(TAG, "DISCO from unknown peer, dropped before decrypt");
+        return;
+    }
+
     size_t plaintext_len = ciphertext_len - NACL_BOX_MACBYTES;
     uint8_t *plaintext = malloc(plaintext_len);
     if (!plaintext) return;
 
-    if (nacl_box_open(plaintext, ciphertext, ciphertext_len, nonce,
-                      sender_disco_key, ml->disco_private_key) != 0) {
+    uint8_t box_key[32];
+    disco_box_key(ml, &ml->peers[peer_idx], box_key);
+    int open_rc = nacl_box_open_afternm(plaintext, ciphertext, ciphertext_len, nonce, box_key);
+    mbedtls_platform_zeroize(box_key, sizeof(box_key));
+    if (open_rc != 0) {
         ESP_LOGW(TAG, "DISCO decrypt failed");
         free(plaintext);
         return;
@@ -1140,21 +1132,15 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     uint8_t msg_type = plaintext[0];
     switch (msg_type) {
     case DISCO_MSG_PING:
-        process_disco_ping(ml, pkt, sender_disco_key, plaintext, plaintext_len);
+        process_disco_ping(ml, pkt, peer_idx, plaintext, plaintext_len);
         break;
     case DISCO_MSG_PONG:
-        process_disco_pong(ml, pkt, sender_disco_key, plaintext, plaintext_len);
+        process_disco_pong(ml, pkt, peer_idx, plaintext, plaintext_len);
         break;
     case DISCO_MSG_CALL_ME_MAYBE:
         {
             /* CallMeMaybe: after type(1)+version(1), payload is N x 18-byte entries
              * Each entry: 16-byte IP (IPv6 or IPv4-mapped) + 2-byte port (big-endian) */
-            int peer_idx = find_peer_by_disco_key(ml, sender_disco_key);
-            if (peer_idx < 0) {
-                ESP_LOGW(TAG, "CallMeMaybe from unknown peer");
-                break;
-            }
-
             const uint8_t *ep_data = plaintext + 2;
             size_t ep_data_len = plaintext_len - 2;
             int ep_count = ep_data_len / 18;
@@ -1340,9 +1326,11 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     uint8_t nonce[DISCO_NONCE_LEN];
     esp_fill_random(nonce, DISCO_NONCE_LEN);
 
+    uint8_t box_key[32];
+    disco_box_key(ml, p, box_key);
     uint8_t ciphertext[sizeof(plaintext) + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, pt_len, nonce,
-             p->disco_key, ml->disco_private_key);
+    nacl_box_afternm(ciphertext, plaintext, pt_len, nonce, box_key);
+    mbedtls_platform_zeroize(box_key, sizeof(box_key));
 
     /* Build packet: magic(6) + disco_pubkey(32) + nonce(24) + ciphertext */
     uint8_t pkt[256];

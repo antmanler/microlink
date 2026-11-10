@@ -282,6 +282,22 @@ typedef struct {
     uint32_t vpn_ip;
     uint8_t public_key[32];
     uint8_t disco_key[32];
+    /* Cache of the NaCl box key for DISCO with this peer, nacl_box_beforenm(disco_key,
+     * ml->disco_private_key). Deriving it is an X25519 in software and wg_mgr runs
+     * everything in one loop, so it is derived once per peer. Valid only while
+     * disco_shared_valid; ml_disco_key.c owns every write to it, and only the wg_mgr task
+     * may use the cache (ml_wg_mgr_send_cmm() runs on its caller's task and derives the key
+     * itself). It depends on two inputs:
+     *  - disco_key: assigned only by ml_peer_set_disco_key(), which invalidates unless the
+     *    bytes are unchanged, and by ml_peer_nvs_load_all(), whose memset leaves a slot
+     *    invalid; a removed slot is cleared (ml_peer_disco_cache_clear()), and so is a new
+     *    peer's slot.
+     *  - ml->disco_private_key: written only by load_or_generate_keys() inside
+     *    microlink_init(), before any task exists, and wiped by microlink_destroy() after
+     *    they are gone. It does not change while any task that uses it exists, so no peer
+     *    needs invalidating. */
+    uint8_t disco_shared_key[32];
+    bool disco_shared_valid;
     char hostname[64];
     bool active;
     bool priority;                  /* never evicted; may evict another peer */
@@ -790,6 +806,12 @@ size_t ml_auth_url_length(const microlink_t *ml);                      /* no sta
 esp_err_t ml_auth_url_copy(const microlink_t *ml, char *buf, size_t len);
 void ml_set_self_fqdn(microlink_t *ml, const char *fqdn);
 const char *ml_device_name(const microlink_t *ml);   /* Hostinfo.Hostname */
+
+/* ml_disco_key.c: per-peer cache of the NaCl box key for DISCO (see ml_peer_t) */
+void ml_peer_disco_cache_clear(ml_peer_t *p);                            /* invalidate and wipe */
+void ml_peer_set_disco_key(ml_peer_t *p, const uint8_t disco_key[32]);   /* invalidates unless unchanged */
+void ml_peer_disco_box_key(ml_peer_t *p, const uint8_t our_disco_private_key[32],
+                           bool use_cache, uint8_t out[32]);             /* copy; the caller wipes out */
 
 /* ml_peer_policy.c: priority peer by name, peer table admission */
 bool ml_dns_name_equal(const char *a, const char *b);
